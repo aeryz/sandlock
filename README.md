@@ -229,3 +229,7 @@ The `image` feature enables container image loading and is enabled by default.
 Remote registry and Docker daemon transports additionally require `http`; local
 OCI layouts and archives work without it. Disabled image requests through the
 CLI or FFI return an error.
+
+The `profiles` feature enables TOML profile loading, writing, and CLI learning.
+It is enabled by default. The profile schema and JSON policy inspection remain
+available without it; TOML operations return a feature-disabled error.

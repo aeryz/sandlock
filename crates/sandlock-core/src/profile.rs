@@ -191,6 +191,7 @@ pub struct LimitsSection {
 
 impl ProfileInput {
     /// Serialize the profile to a TOML string.
+    #[cfg(feature = "profiles")]
     pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
         toml::to_string(self)
     }
@@ -753,6 +754,7 @@ pub fn sandbox_to_profile(s: &Sandbox, extra_denied: &[String]) -> ProfileInput 
 }
 
 /// Serialize a `Sandbox` to a TOML profile string.
+#[cfg(feature = "profiles")]
 pub fn sandbox_to_toml(s: &Sandbox, extra_denied: &[String]) -> Result<String, SandlockError> {
     let input = sandbox_to_profile(s, extra_denied);
     toml::to_string_pretty(&input).map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
@@ -770,10 +772,11 @@ pub fn sandbox_to_json(s: &Sandbox, extra_denied: &[String]) -> Result<String, S
 
 /// Named profiles live only under the user's home, resolved as `${HOME}` is
 /// inside profiles, so policy is never read from a shared or relative path.
+#[cfg(feature = "profiles")]
 pub fn profile_dir() -> Result<PathBuf, SandlockError> {
     Ok(PathBuf::from(crate::expand::resolve_home()?).join(".config/sandlock/profiles"))
 }
-
+#[cfg(feature = "profiles")]
 fn parse_toml(content: &str) -> Result<ProfileInput, SandlockError> {
     toml::from_str(content)
         .map_err(|e| SandlockError::Sandbox(crate::error::SandboxError::Invalid(
@@ -823,7 +826,7 @@ pub fn list_profiles() -> Result<Vec<String>, SandlockError> {
     Ok(names)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "profiles"))]
 mod tests {
     use super::*;
 
@@ -1338,4 +1341,27 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("unknown field"), "got: {msg}");
     }
+}
+
+#[cfg(not(feature = "profiles"))]
+fn profiles_disabled() -> SandlockError {
+    crate::error::SandboxError::FeatureDisabled {
+        what: "TOML profiles".into(),
+        feature: "profiles",
+    }.into()
+}
+
+#[cfg(not(feature = "profiles"))]
+fn parse_toml(_content: &str) -> Result<ProfileInput, SandlockError> {
+    Err(profiles_disabled())
+}
+
+#[cfg(not(feature = "profiles"))]
+pub fn sandbox_to_toml(_s: &Sandbox, _extra_denied: &[String]) -> Result<String, SandlockError> {
+    Err(profiles_disabled())
+}
+
+#[cfg(not(feature = "profiles"))]
+pub fn profile_dir() -> Result<PathBuf, SandlockError> {
+    Err(profiles_disabled())
 }

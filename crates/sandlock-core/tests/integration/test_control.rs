@@ -201,6 +201,7 @@ fn test_control_sandbox_to_profile() {
 }
 
 #[test]
+#[cfg(feature = "profiles")]
 fn test_control_mode_stays_out_of_profile() {
     // The mode marker is ps metadata, not policy: inspect output (a
     // ProfileInput) must not carry it.
@@ -251,6 +252,7 @@ fn test_control_sandbox_to_profile_merges_dynamic_denies() {
 }
 
 #[test]
+#[cfg(feature = "profiles")]
 fn test_control_sandbox_to_toml_roundtrip() {
     let sb = sandlock_core::Sandbox::builder()
         .fs_read("/usr")

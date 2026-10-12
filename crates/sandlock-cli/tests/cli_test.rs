@@ -82,6 +82,7 @@ fn test_run_hostname_virtualized() {
 }
 
 #[test]
+#[cfg(feature = "profiles")]
 fn test_profile_list_empty() {
     let output = sandlock_bin()
         .args(["profile", "list"])
@@ -366,6 +367,7 @@ fn test_uid_mapping_arbitrary_uid() {
 /// `sandlock run --profile-file` prints a hint to stderr suggesting
 /// `sandlock learn --merge` when the sandboxed process exits non-zero.
 #[test]
+#[cfg(feature = "profiles")]
 fn test_run_denial_hint_on_nonzero_exit() {
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
     let profile_path = profile.path().to_str().unwrap().to_owned();
@@ -585,6 +587,7 @@ fn test_inspect_returns_json_policy() {
 }
 
 #[test]
+#[cfg(feature = "profiles")]
 fn test_inspect_toml_flag_produces_toml() {
     let name = format!("test-config-toml-cli-{}", std::process::id());
     let mut child = spawn_sandbox(&name);
