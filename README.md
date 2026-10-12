@@ -224,3 +224,8 @@ Cargo feature, enabled by default. Disable default features to omit checkpoint
 support and its `bincode` dependency. The CLI, FFI, and OCI crates forward this
 feature to `sandlock-core`. FFI checkpoint entry points remain available and
 return their documented failure values when checkpoint support is disabled.
+
+The `image` feature enables container image loading and is enabled by default.
+Remote registry and Docker daemon transports additionally require `http`; local
+OCI layouts and archives work without it. Disabled image requests through the
+CLI or FFI return an error.

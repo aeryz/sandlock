@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        feature: [minimal, checkpoint, default]
+        feature: [minimal, checkpoint, image, default]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,7 +27,7 @@ jobs:
         if: matrix.feature == 'minimal'
         run: |
           if cargo tree --workspace --no-default-features -e normal --prefix none \
-              | grep -E '^(bincode|hyper|rustls|rcgen|bollard) '; then
+              | grep -E '^(bincode|tar|flate2|ruzstd|base64|hyper|rustls|rcgen|bollard) '; then
             exit 1
           fi
       - name: Test selected features

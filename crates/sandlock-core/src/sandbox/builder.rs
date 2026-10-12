@@ -744,6 +744,7 @@ impl SandboxBuilder {
     /// has not set, so explicit settings win whichever order they come in.
     /// Writes land in a copy-on-write branch that is always discarded; see
     /// `build_unchecked`.
+    #[cfg(feature = "image")]
     pub fn image(mut self, image: &crate::image::Image) -> Self {
         self.chroot = Some(image.rootfs.clone());
         self.image_rootfs = Some(image.rootfs.clone());

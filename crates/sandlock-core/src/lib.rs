@@ -34,6 +34,7 @@ pub(crate) mod port_remap;
 pub mod pipeline;
 pub mod transaction;
 pub mod policy_fn;
+#[cfg(feature = "image")]
 pub mod image;
 pub mod fork;
 pub(crate) mod ca_inject;

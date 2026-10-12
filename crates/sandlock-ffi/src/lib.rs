@@ -200,6 +200,7 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_chroot(
 ///
 /// # Safety
 /// `b` and `image_json` must be valid pointers.
+#[cfg(feature = "image")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_sandbox_builder_image(
     b: *mut SandboxBuilder,
@@ -2668,6 +2669,7 @@ pub unsafe extern "C" fn sandlock_checkpoint_save(
 /// # Safety
 /// `reference` must be a valid C string; `cache_dir` a valid C string or
 /// NULL; `err_msg` a valid pointer or NULL.
+#[cfg(feature = "image")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_image_pull(
     reference: *const c_char,

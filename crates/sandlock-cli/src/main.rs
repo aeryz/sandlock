@@ -645,9 +645,14 @@ async fn run_command(args: RunArgs) -> Result<i32> {
 
     let image_cmd: Option<Vec<String>>;
     if let Some(ref img) = args.image {
+        #[cfg(not(feature = "image"))]
+        return Err(anyhow!("image support is disabled; enable the image feature"));
+        #[cfg(feature = "image")]
+        {
         let image = sandlock_core::image::pull(img, None).await?;
         builder = builder.image(&image);
         image_cmd = args.cmd.is_empty().then(|| image.config.default_cmd());
+        }
     } else {
         image_cmd = None;
     }
