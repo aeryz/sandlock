@@ -2609,6 +2609,7 @@ pub unsafe extern "C" fn sandlock_sandbox_fns_free(sb: *mut Sandbox) {
 // ----------------------------------------------------------------
 
 /// Opaque handle wrapping a [`Checkpoint`].
+#[cfg(feature = "checkpoint")]
 #[allow(non_camel_case_types)]
 pub struct sandlock_checkpoint_t {
     _private: sandlock_core::Checkpoint,
@@ -2620,6 +2621,7 @@ pub struct sandlock_checkpoint_t {
 ///
 /// # Safety
 /// `h` must be a valid handle from `sandlock_create`.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_checkpoint(
     h: *mut sandlock_handle_t,
@@ -2639,6 +2641,7 @@ pub unsafe extern "C" fn sandlock_handle_checkpoint(
 ///
 /// # Safety
 /// `cp` must be a valid checkpoint pointer. `dir` must be a valid C string path.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_checkpoint_save(
     cp: *const sandlock_checkpoint_t,
@@ -2761,6 +2764,7 @@ pub unsafe extern "C" fn sandlock_profile_dir(err_msg: *mut *mut c_char) -> *mut
 ///
 /// # Safety
 /// `dir` must be a valid C string path to a checkpoint directory.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_checkpoint_load(
     dir: *const c_char,
@@ -2779,6 +2783,7 @@ pub unsafe extern "C" fn sandlock_checkpoint_load(
 ///
 /// # Safety
 /// `cp` must be a valid checkpoint pointer. `name` must be a valid C string.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_checkpoint_set_name(
     cp: *mut sandlock_checkpoint_t,
@@ -2794,6 +2799,7 @@ pub unsafe extern "C" fn sandlock_checkpoint_set_name(
 ///
 /// # Safety
 /// `cp` must be a valid checkpoint pointer.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_checkpoint_name(cp: *const sandlock_checkpoint_t) -> *mut c_char {
     if cp.is_null() {
@@ -2809,6 +2815,7 @@ pub unsafe extern "C" fn sandlock_checkpoint_name(cp: *const sandlock_checkpoint
 ///
 /// # Safety
 /// `cp` must be valid. `data` must point to `len` bytes, or be NULL to clear.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_checkpoint_set_app_state(
     cp: *mut sandlock_checkpoint_t,
@@ -2830,6 +2837,7 @@ pub unsafe extern "C" fn sandlock_checkpoint_set_app_state(
 ///
 /// # Safety
 /// `cp` must be a valid checkpoint pointer. `len` must be a valid pointer.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_checkpoint_app_state(
     cp: *const sandlock_checkpoint_t,
@@ -2854,6 +2862,7 @@ pub unsafe extern "C" fn sandlock_checkpoint_app_state(
 ///
 /// # Safety
 /// `cp` must be null or a valid checkpoint pointer.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_checkpoint_free(cp: *mut sandlock_checkpoint_t) {
     if !cp.is_null() {
@@ -2884,6 +2893,7 @@ pub unsafe extern "C" fn sandlock_checkpoint_free(cp: *mut sandlock_checkpoint_t
 /// `policy` must be a valid policy pointer and `cp` a valid checkpoint
 /// pointer. `name` may be NULL to auto-generate a sandbox name, or a valid
 /// NUL-terminated string.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_restore_interactive(
     policy: *const sandlock_sandbox_t,
@@ -2932,6 +2942,7 @@ pub unsafe extern "C" fn sandlock_restore_interactive(
 ///
 /// # Safety
 /// `h` must be null or a valid handle.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_restore_skipped_len(
     h: *const sandlock_handle_t,
@@ -2947,6 +2958,7 @@ pub unsafe extern "C" fn sandlock_handle_restore_skipped_len(
 ///
 /// # Safety
 /// `h` must be null or a valid handle.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_restore_skipped_fd(
     h: *const sandlock_handle_t,
@@ -2967,6 +2979,7 @@ pub unsafe extern "C" fn sandlock_handle_restore_skipped_fd(
 ///
 /// # Safety
 /// `h` must be null or a valid handle.
+#[cfg(feature = "checkpoint")]
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_restore_skipped_path(
     h: *const sandlock_handle_t,

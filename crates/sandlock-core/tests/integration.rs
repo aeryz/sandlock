@@ -10,6 +10,7 @@ mod test_determinism;
 #[path = "integration/test_cow.rs"]
 mod test_cow;
 
+#[cfg(feature = "checkpoint")]
 #[path = "integration/test_checkpoint.rs"]
 mod test_checkpoint;
 
@@ -79,6 +80,7 @@ mod test_http_inject_ca;
 #[path = "integration/test_http_strict_tls.rs"]
 mod test_http_strict_tls;
 
+#[cfg(feature = "checkpoint")]
 #[path = "integration/test_restore.rs"]
 mod test_restore;
 

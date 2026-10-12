@@ -607,6 +607,7 @@ pub struct Sandbox {
     // Fds the last `restore_interactive` could not transparently recreate.
     // Runtime state: not serialized, not cloned.
     #[serde(skip)]
+    #[cfg(feature = "checkpoint")]
     restore_skipped: Vec<crate::checkpoint::SkippedFd>,
 }
 
@@ -699,6 +700,7 @@ impl Clone for Sandbox {
             // Runtime is NOT cloned — the clone starts with no runtime.
             runtime: None,
             // Restore diagnostics belong to the original's run, not the clone.
+            #[cfg(feature = "checkpoint")]
             restore_skipped: Vec::new(),
         }
     }
@@ -1242,6 +1244,7 @@ impl Sandbox {
     ///
     /// On error the child may be left mid-restore; the caller should drop/kill
     /// the Sandbox (Drop reaps it).
+    #[cfg(feature = "checkpoint")]
     pub async fn restore_interactive(
         &mut self,
         cp: &crate::checkpoint::Checkpoint,
@@ -1305,6 +1308,7 @@ impl Sandbox {
     /// not transparently recreate (sockets, pipes, memfds, pseudo-filesystem
     /// paths); the restored process runs without them. Empty if this sandbox
     /// never restored a checkpoint or every fd was restored.
+    #[cfg(feature = "checkpoint")]
     pub fn restore_skipped(&self) -> &[crate::checkpoint::SkippedFd] {
         &self.restore_skipped
     }
@@ -1417,6 +1421,7 @@ impl Sandbox {
     }
 
     /// Capture a checkpoint of the running sandbox.
+    #[cfg(feature = "checkpoint")]
     pub async fn checkpoint(&self) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         let pid = self.runtime.as_ref()
@@ -1429,6 +1434,7 @@ impl Sandbox {
     /// direct child. The target must be a fork-descendant confined by the same
     /// policy (e.g. the workload spawned by sandlock-init). `target_pid` must
     /// be positive.
+    #[cfg(feature = "checkpoint")]
     pub async fn checkpoint_pid(&self, target_pid: i32) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
         if target_pid <= 0 {

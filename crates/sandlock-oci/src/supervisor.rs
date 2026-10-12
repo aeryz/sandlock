@@ -174,6 +174,7 @@ pub enum SupervisorCmd {
     /// parked child.
     Shutdown,
     /// Capture a checkpoint of the running child into `dir`.
+    #[cfg(feature = "checkpoint")]
     Checkpoint { dir: String },
     /// Run an additional process inside the running container. Carries 3
     /// ancillary fds (stdin, stdout, stderr) over SCM_RIGHTS alongside this
@@ -506,6 +507,7 @@ async fn supervisor_main(
                 let _ = stream.write_all(b"\n").await;
                 return Ok(None);
             }
+            #[cfg(feature = "checkpoint")]
             SupervisorCmd::Checkpoint { dir } => {
                 let reply = match sandbox.checkpoint().await {
                     Ok(mut cp) => {
@@ -632,6 +634,7 @@ async fn serve_one_running_init(
             handle_exec(stream, link.clone(), args, env, cwd, detach, fds).await;
             RunningCmd::Continue
         }
+        #[cfg(feature = "checkpoint")]
         SupervisorCmd::Checkpoint { dir } => {
             // Capture the WORKLOAD, not sandlock-init (which is the sandbox's
             // direct child and would only snapshot the init process blocked in
@@ -821,6 +824,7 @@ async fn serve_one_running(
             let _ = stream.write_all(b"\n").await;
             RunningCmd::Continue
         }
+        #[cfg(feature = "checkpoint")]
         SupervisorCmd::Checkpoint { dir } => {
             let reply = match sandbox.checkpoint().await {
                 Ok(mut cp) => {
@@ -935,6 +939,7 @@ async fn reap_and_collapse(
 /// saved `Sandbox`), not from an `OciPolicy`, and there is no separate `start`:
 /// `restore_interactive` both creates the child and resumes it, so the sandbox
 /// is `Running` the moment restore returns.
+#[cfg(feature = "checkpoint")]
 pub fn run_supervisor_restore(id: &str, image_dir: &str, pid_write_fd: i32) -> Result<()> {
     // Load the checkpoint image. On failure report back through the pid pipe so
     // the CLI surfaces a clear error rather than a bare EOF.
@@ -966,6 +971,7 @@ pub fn run_supervisor_restore(id: &str, image_dir: &str, pid_write_fd: i32) -> R
 }
 
 /// Async body of [`run_supervisor_restore`].
+#[cfg(feature = "checkpoint")]
 async fn supervisor_restore_main(
     id: &str,
     mut sandbox: sandlock_core::Sandbox,
@@ -1110,6 +1116,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "checkpoint")]
     fn supervisor_cmd_checkpoint_serde() {
         let cmd = SupervisorCmd::Checkpoint { dir: "/tmp/img".into() };
         let json = serde_json::to_string(&cmd).unwrap();

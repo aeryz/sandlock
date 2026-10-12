@@ -1,3 +1,5 @@
+#![cfg(feature = "checkpoint")]
+
 //! Integration test for the C ABI checkpoint-restore `sandlock_restore_interactive`.
 //!
 //! Drives the FFI symbols directly (no C compilation step of the bindings;

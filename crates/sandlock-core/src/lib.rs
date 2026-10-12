@@ -25,6 +25,7 @@ pub(crate) mod random;
 pub(crate) mod time;
 pub(crate) mod cow;
 pub mod recovery;
+#[cfg(feature = "checkpoint")]
 pub(crate) mod checkpoint;
 pub(crate) mod freeze;
 pub mod netlink;
@@ -46,6 +47,7 @@ mod transparent_proxy;
 
 pub use error::SandlockError;
 pub use sys::structs::{SeccompData, SeccompNotif};
+#[cfg(feature = "checkpoint")]
 pub use checkpoint::{Checkpoint, SkippedFd};
 pub use protection::{Protection, ProtectionState, ProtectionPolicy, ProtectionStatus};
 pub use sandbox::{

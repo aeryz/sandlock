@@ -1147,6 +1147,7 @@ impl SandboxBuilder {
             init_fn: self.init_fn,
             work_fn: self.work_fn,
             runtime: None,
+            #[cfg(feature = "checkpoint")]
             restore_skipped: Vec::new(),
         })
     }

@@ -186,6 +186,7 @@ enum Command {
     },
 
     /// Capture a checkpoint of a running sandbox to an image directory.
+    #[cfg(feature = "checkpoint")]
     Checkpoint {
         /// Sandbox/container ID.
         id: String,
@@ -195,6 +196,7 @@ enum Command {
     },
 
     /// Restore a sandbox from a checkpoint image directory (resumes it running).
+    #[cfg(feature = "checkpoint")]
     Restore {
         /// Sandbox/container ID to create.
         id: String,
@@ -328,9 +330,11 @@ fn run(cli: Cli) -> Result<()> {
             }
             println!("Platform: {}", std::env::consts::ARCH);
         }
+        #[cfg(feature = "checkpoint")]
         Command::Checkpoint { id, image_path } => {
             cmd_checkpoint(&id, &image_path)?;
         }
+        #[cfg(feature = "checkpoint")]
         Command::Restore { id, image_path, bundle: _, no_pivot: _, no_new_keyring: _ } => {
             cmd_restore(&id, &image_path)?;
         }
@@ -562,6 +566,7 @@ fn cmd_create(id: &str, bundle: &PathBuf, pid_file: Option<&std::path::Path>) ->
 /// policy and command come from the checkpoint image (not an OCI bundle), and
 /// there is no separate `start`: `run_supervisor_restore` both creates and
 /// resumes the child, so the sandbox is `Running` once the handshake succeeds.
+#[cfg(feature = "checkpoint")]
 fn cmd_restore(id: &str, image_path: &str) -> Result<()> {
     // Reject a re-used ID up front, exactly like `create`.
     if SandboxState::load(id).is_ok() {
@@ -787,6 +792,7 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
 /// `sandlock-oci checkpoint <id> --image-path <dir>`
 ///
 /// Asks the Supervisor to snapshot the running sandbox into an image directory.
+#[cfg(feature = "checkpoint")]
 fn cmd_checkpoint(id: &str, image_path: &str) -> Result<()> {
     match supervisor::send_command(id, supervisor::SupervisorCmd::Checkpoint { dir: image_path.to_string() })? {
         supervisor::SupervisorReply::Ok => Ok(()),

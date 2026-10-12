@@ -13,7 +13,8 @@ name = "sandlock"
 path = "src/main.rs"
 
 [features]
-default = ["http"]
+checkpoint = ["sandlock-core/checkpoint"]
+default = ["http", "checkpoint"]
 http = ["sandlock-core/http"]
 
 [dependencies]

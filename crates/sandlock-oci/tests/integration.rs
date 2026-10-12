@@ -251,6 +251,7 @@ void _start(void){{
 /// the counter past the checkpointed baseline, that `state` reports `running`,
 /// then `delete --force` cleans up.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "checkpoint")]
 async fn oci_restore_resumes_vdso_free_program() {
     if cfg!(not(target_arch = "x86_64")) {
         eprintln!("skipping: this test is x86_64-only (counter program)");
@@ -413,6 +414,7 @@ fn build_counter(bin: &Path, src: &Path, out_path: &str) -> bool {
 /// image into a second container and proves the restored counter advances,
 /// exercising a full OCI checkpoint -> restore round-trip of a running program.
 #[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "checkpoint")]
 async fn oci_checkpoint_of_running_container() {
     if cfg!(not(target_arch = "x86_64")) {
         eprintln!("skipping: this test is x86_64-only (counter program)");

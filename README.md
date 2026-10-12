@@ -216,3 +216,11 @@ cargo test --release
 # Python tests
 cd python && pip install -e . && pytest tests/
 ```
+
+### Optional features
+
+Checkpoint capture, restore, and persistence are controlled by the `checkpoint`
+Cargo feature, enabled by default. Disable default features to omit checkpoint
+support and its `bincode` dependency. The CLI, FFI, and OCI crates forward this
+feature to `sandlock-core`. FFI checkpoint entry points remain available and
+return their documented failure values when checkpoint support is disabled.
