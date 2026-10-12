@@ -481,7 +481,9 @@ async fn cow_resolve(
     cow_state: &Arc<Mutex<CowState>>,
     host_path: &Path,
 ) -> Result<PathBuf, NotifAction> {
+    #[cfg(feature = "cow")]
     let cs = cow_state.lock().await;
+    #[cfg(feature = "cow")]
     if let Some(ref cow) = cs.branch {
         let host_str = host_path.to_string_lossy();
         if cow.matches(&host_str) {
@@ -616,7 +618,9 @@ pub(crate) async fn handle_chroot_open(
     // A symlink in the image is followed inside that layer's root, never on
     // the host, because the supervisor holds no chroot of its own.
     {
+        #[cfg(feature = "cow")]
         let mut cs = cow_state.lock().await;
+        #[cfg(feature = "cow")]
         if let Some(cow) = cs.branch.as_mut() {
             let host_str = host_path.to_string_lossy();
             if cow.matches(&host_str) {
@@ -1303,7 +1307,9 @@ pub(crate) async fn handle_chroot_write(
         let is_dir = (notif.data.args[2] & libc::AT_REMOVEDIR as u64) != 0;
 
         {
+            #[cfg(feature = "cow")]
             let mut cs = cow_state.lock().await;
+            #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
@@ -1330,7 +1336,9 @@ pub(crate) async fn handle_chroot_write(
         let mode = notif.data.args[2] as u32;
 
         {
+            #[cfg(feature = "cow")]
             let mut cs = cow_state.lock().await;
+            #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
@@ -1372,7 +1380,9 @@ pub(crate) async fn handle_chroot_write(
         }
 
         {
+            #[cfg(feature = "cow")]
             let mut cs = cow_state.lock().await;
+            #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
                 let old_str = old_host.to_string_lossy();
                 if cow.matches(&old_str) {
@@ -1411,7 +1421,9 @@ pub(crate) async fn handle_chroot_write(
         if !ctx.can_write(&link_vp) { return NotifAction::Errno(libc::EACCES); }
 
         {
+            #[cfg(feature = "cow")]
             let mut cs = cow_state.lock().await;
+            #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
                 let s = host_link.to_string_lossy();
                 if cow.matches(&s) {
@@ -1494,7 +1506,9 @@ pub(crate) async fn handle_chroot_write(
         }
 
         {
+            #[cfg(feature = "cow")]
             let mut cs = cow_state.lock().await;
+            #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
                 let old_s = old_host.to_string_lossy();
                 let new_s = new_host.to_string_lossy();
@@ -1554,7 +1568,9 @@ pub(crate) async fn handle_chroot_write(
         let mode = (notif.data.args[2] & 0o7777) as u32;
 
         {
+            #[cfg(feature = "cow")]
             let mut cs = cow_state.lock().await;
+            #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
@@ -1585,7 +1601,9 @@ pub(crate) async fn handle_chroot_write(
         let gid = notif.data.args[3] as u32;
 
         {
+            #[cfg(feature = "cow")]
             let mut cs = cow_state.lock().await;
+            #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
@@ -1618,7 +1636,9 @@ pub(crate) async fn handle_chroot_write(
         let length = notif.data.args[1] as i64;
 
         {
+            #[cfg(feature = "cow")]
             let mut cs = cow_state.lock().await;
+            #[cfg(feature = "cow")]
             if let Some(cow) = cs.branch.as_mut() {
                 let s = host_path.to_string_lossy();
                 if cow.matches(&s) {
@@ -1902,7 +1922,9 @@ pub(crate) async fn handle_chroot_readlink(
 
     // COW
     {
+        #[cfg(feature = "cow")]
         let cs = cow_state.lock().await;
+        #[cfg(feature = "cow")]
         if let Some(cow) = cs.branch.as_ref() {
             let host_str = host_path.to_string_lossy();
             if cow.matches(&host_str) {

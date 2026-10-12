@@ -306,6 +306,7 @@ struct Runtime {
     // Parent-held write end of a piped stdin (popen). The caller takes it via
     // `Process::take_stdin`; closing it signals EOF to the child.
     _stdin_write: Option<std::os::fd::OwnedFd>,
+    #[cfg(feature = "cow")]
     seccomp_cow: Option<crate::cow::seccomp::SeccompCowBranch>,
     supervisor_resource: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::ResourceState>>>,
     supervisor_cow: Option<Arc<tokio::sync::Mutex<crate::seccomp::state::CowState>>>,
@@ -326,6 +327,7 @@ struct Runtime {
     /// reuses this `CowState` (instead of building its own branch), and neither
     /// `wait()` nor `Drop` take/commit/abort the branch — the transaction
     /// coordinator owns the single commit/abort. See [`SharedCow`].
+    #[cfg(feature = "cow")]
     shared_cow: Option<SharedCow>,
     // The interactive child took the terminal's foreground process group at
     // spawn; whoever reaps it must hand the foreground back to this process.
@@ -337,6 +339,7 @@ struct Runtime {
 /// `Runtime` so sequential stages accumulate writes in the same upper
 /// (read-committed), while the coordinator retains the original to commit/abort
 /// once at the end.
+#[cfg(feature = "cow")]
 #[derive(Clone)]
 pub(crate) struct SharedCow {
     /// The shared supervisor COW state (holds the single `SeccompCowBranch`).
@@ -1042,6 +1045,7 @@ impl Sandbox {
     /// set, and apply the exit action. `Defer` leaves the branch in place for
     /// [`Self::commit`] / [`Self::abort`], so a repeat call finds it again and
     /// only re-reads the changes.
+    #[cfg(feature = "cow")]
     async fn settle_branch(&mut self) -> Vec<crate::result::Change> {
         // A transactional-pipeline stage leaves the branch in the shared COW
         // state for the next stage / the coordinator's single commit: taking it
@@ -1083,6 +1087,7 @@ impl Sandbox {
 
     /// Whether a [`BranchAction::Defer`] run has exited and is waiting for
     /// [`Self::commit`] or [`Self::abort`].
+    #[cfg(feature = "cow")]
     pub fn pending(&self) -> bool {
         self.runtime.as_ref().is_some_and(|rt| {
             rt.seccomp_cow.is_some() && matches!(rt.state, RuntimeState::Stopped(_))
@@ -1091,6 +1096,7 @@ impl Sandbox {
 
     /// The pending branch's upper directory, laid out like the workdir and
     /// holding the new bytes of every added or modified file.
+    #[cfg(feature = "cow")]
     pub fn upper_dir(&self) -> Option<&std::path::Path> {
         if !self.pending() { return None; }
         self.rt().seccomp_cow.as_ref().map(|b| b.upper_dir())
@@ -1100,20 +1106,41 @@ impl Sandbox {
     /// contended workdir; on timeout the branch is preserved and the error
     /// names it. Last-writer-wins against anything that changed the workdir
     /// since the run.
+    #[cfg(feature = "cow")]
     pub fn commit(&mut self) -> Result<(), crate::error::BranchError> {
         self.take_pending()?.commit()
     }
 
     /// Discard the pending branch.
+    #[cfg(feature = "cow")]
     pub fn abort(&mut self) -> Result<(), crate::error::BranchError> {
         self.take_pending()?.abort()
     }
-
+    #[cfg(feature = "cow")]
     fn take_pending(&mut self) -> Result<crate::cow::seccomp::SeccompCowBranch, crate::error::BranchError> {
         if !self.pending() {
             return Err(crate::error::BranchError::Operation("no deferred branch to dispose".into()));
         }
         Ok(self.rt_mut().seccomp_cow.take().expect("pending() checked seccomp_cow"))
+    }
+
+    #[cfg(not(feature = "cow"))]
+    async fn settle_branch(&mut self) -> Vec<crate::result::Change> { Vec::new() }
+
+    #[cfg(not(feature = "cow"))]
+    pub fn pending(&self) -> bool { false }
+
+    #[cfg(not(feature = "cow"))]
+    pub fn upper_dir(&self) -> Option<&std::path::Path> { None }
+
+    #[cfg(not(feature = "cow"))]
+    pub fn commit(&mut self) -> Result<(), crate::error::BranchError> {
+        Err(crate::error::BranchError::Operation("COW support is disabled; enable the cow feature".into()))
+    }
+
+    #[cfg(not(feature = "cow"))]
+    pub fn abort(&mut self) -> Result<(), crate::error::BranchError> {
+        Err(crate::error::BranchError::Operation("COW support is disabled; enable the cow feature".into()))
     }
 
     /// Join the capture-pipe drains, if this runtime still holds them.
@@ -1656,6 +1683,7 @@ impl Sandbox {
                 stdout_drain: None,
                 stderr_drain: None,
                 _stdin_write: None,
+                #[cfg(feature = "cow")]
                 seccomp_cow: None,
                 supervisor_resource: None,
                 supervisor_cow: None,
@@ -1669,6 +1697,7 @@ impl Sandbox {
                 on_bind: None,
                 handlers: Vec::new(),
                 ready_w: None,
+                #[cfg(feature = "cow")]
                 shared_cow: None,
                 tty_foreground_taken: false,
                 control_handle: None,
@@ -1761,6 +1790,7 @@ impl Sandbox {
             stdout_drain: None,
             stderr_drain: None,
             _stdin_write: None,
+            #[cfg(feature = "cow")]
             seccomp_cow: None,
             supervisor_resource: None,
             supervisor_cow: None,
@@ -1774,6 +1804,7 @@ impl Sandbox {
             on_bind: None,
             handlers: Vec::new(),
             ready_w: None,
+            #[cfg(feature = "cow")]
             shared_cow: None,
             tty_foreground_taken: false,
         }));
@@ -1784,6 +1815,7 @@ impl Sandbox {
     /// The stage reuses the shared upper instead of building its own, and leaves
     /// commit/abort to the transaction coordinator. Internal — used only by
     /// [`Transaction`](crate::transaction::Transaction).
+    #[cfg(feature = "cow")]
     pub(crate) fn set_shared_cow(&mut self, shared: SharedCow) -> Result<(), crate::error::SandlockError> {
         self.ensure_runtime()?;
         self.rt_mut().shared_cow = Some(shared);
@@ -1818,6 +1850,14 @@ impl Sandbox {
         use crate::sys::syscall;
         use std::time::Duration;
 
+        #[cfg(not(feature = "cow"))]
+        if self.workdir.is_some() || self.fs_storage.is_some() || self.max_disk.is_some()
+            || self.on_exit != BranchAction::Commit || self.on_error != BranchAction::Commit
+        {
+            return Err(crate::error::SandboxError::FeatureDisabled {
+                what: "copy-on-write filesystem".into(), feature: "cow",
+            }.into());
+        }
         self.ensure_runtime()?;
 
         if !matches!(self.rt().state, RuntimeState::Created) {
@@ -1927,7 +1967,9 @@ impl Sandbox {
         // A transactional-pipeline stage reuses one shared upper across stages;
         // it must not build its own branch. Grant Landlock read+exec on the
         // shared upper so a binary created in the workdir stays executable.
+        #[cfg(feature = "cow")]
         let shared_cow = self.rt().shared_cow.clone();
+        #[cfg(feature = "cow")]
         let seccomp_cow_branch = if let Some(ref shared) = shared_cow {
             self.fs_readable.push(shared.upper_dir.clone());
             self.cow_upper = Some(shared.upper_dir.clone());
@@ -2269,10 +2311,12 @@ impl Sandbox {
             res_state.proc_count = 1;
 
             let mut cow_state = CowState::new();
-            cow_state.branch = seccomp_cow_branch;
+            #[cfg(feature = "cow")]
+            { cow_state.branch = seccomp_cow_branch; }
             // A shared transactional-pipeline branch overrides the per-stage one:
             // reuse the coordinator's single COW state so every stage writes into
             // (and reads through) the same upper.
+            #[cfg(feature = "cow")]
             let shared_cow_state = shared_cow.as_ref().map(|s| Arc::clone(&s.state));
 
             let mut policy_fn_state = PolicyFnState::new();
@@ -2323,10 +2367,13 @@ impl Sandbox {
             let res_state = Arc::new(tokio::sync::Mutex::new(res_state));
             self.rt_mut().supervisor_resource = Some(Arc::clone(&res_state));
 
+            #[cfg(feature = "cow")]
             let cow_state = match shared_cow_state {
                 Some(shared) => shared,
                 None => Arc::new(tokio::sync::Mutex::new(cow_state)),
             };
+            #[cfg(not(feature = "cow"))]
+            let cow_state = Arc::new(tokio::sync::Mutex::new(cow_state));
             self.rt_mut().supervisor_cow = Some(Arc::clone(&cow_state));
 
             let net_state = Arc::new(tokio::sync::Mutex::new(net_state));
@@ -2588,6 +2635,7 @@ impl Drop for Sandbox {
         // deferred branch nobody decided on, or one a cancelled wait() never
         // reached.
         let action = self.branch_action();
+        #[cfg(feature = "cow")]
         if let Some(cow) = self.runtime.as_mut().and_then(|rt| rt.seccomp_cow.as_mut()) {
             match action {
                 // NOTE: commit() is synchronous and blocks up to

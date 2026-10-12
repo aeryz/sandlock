@@ -1075,6 +1075,7 @@ mod tests {
 
     #[cfg(feature = "http")]
     #[test]
+    #[cfg(feature = "cow")]
     fn parse_profile_full_example() {
         let toml = r#"
             [config]

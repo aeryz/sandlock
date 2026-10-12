@@ -1,3 +1,5 @@
+#![cfg(feature = "cow")]
+
 //! C ABI `BranchAction` setters: discriminants map onto the Rust enum, and
 //! any other value fails the build instead of picking an action.
 

@@ -1,4 +1,4 @@
-#![cfg(feature = "profiles")]
+#![cfg(all(feature = "profiles", feature = "cow"))]
 
 // Each test here spawns a full `sandlock` process.
 // Running all tests in parallel exhausts kernel resources on most hosts.

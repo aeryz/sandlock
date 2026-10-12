@@ -77,6 +77,19 @@ cd python && pip install -e .
 cargo install --path crates/sandlock-cli
 ```
 
+### Optional features
+
+All five features (`http`, `checkpoint`, `image`, `profiles`, `cow`) are enabled
+by default. Build with none or select the ones you need:
+
+```bash
+cargo build --release --no-default-features
+cargo build --release --no-default-features --features http,profiles
+```
+
+See [Building Sandlock](docs/building.md) for feature dependencies and Rust
+library configuration.
+
 ## Quick Start
 
 ### CLI
@@ -181,6 +194,7 @@ confine(&confinement)?;
 
 | Document | Contents |
 |---|---|
+| [`docs/building.md`](docs/building.md) | Build commands, optional features, and minimal Rust embedding |
 | [`docs/cli.md`](docs/cli.md) | Every `sandlock run` option by example, profiles, `ps` / `inspect` / `kill` |
 | [`docs/sandbox-reference.md`](docs/sandbox-reference.md) | Every `Sandbox` field, default, and TOML key; credentials; protection opt-out |
 | [`docs/network.md`](docs/network.md) | Endpoint grammar, protocol gating, HTTP interception, bind rules, port virtualization |
@@ -216,20 +230,3 @@ cargo test --release
 # Python tests
 cd python && pip install -e . && pytest tests/
 ```
-
-### Optional features
-
-Checkpoint capture, restore, and persistence are controlled by the `checkpoint`
-Cargo feature, enabled by default. Disable default features to omit checkpoint
-support and its `bincode` dependency. The CLI, FFI, and OCI crates forward this
-feature to `sandlock-core`. FFI checkpoint entry points remain available and
-return their documented failure values when checkpoint support is disabled.
-
-The `image` feature enables container image loading and is enabled by default.
-Remote registry and Docker daemon transports additionally require `http`; local
-OCI layouts and archives work without it. Disabled image requests through the
-CLI or FFI return an error.
-
-The `profiles` feature enables TOML profile loading, writing, and CLI learning.
-It is enabled by default. The profile schema and JSON policy inspection remain
-available without it; TOML operations return a feature-disabled error.

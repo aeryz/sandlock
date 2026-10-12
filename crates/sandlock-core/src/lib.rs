@@ -23,7 +23,9 @@ pub(crate) mod seccomp_plan;
 pub(crate) mod vdso;
 pub(crate) mod random;
 pub(crate) mod time;
+#[cfg(feature = "cow")]
 pub(crate) mod cow;
+#[cfg(feature = "cow")]
 pub mod recovery;
 #[cfg(feature = "checkpoint")]
 pub(crate) mod checkpoint;
@@ -32,6 +34,7 @@ pub mod netlink;
 pub(crate) mod procfs;
 pub(crate) mod port_remap;
 pub mod pipeline;
+#[cfg(feature = "cow")]
 pub mod transaction;
 pub mod policy_fn;
 #[cfg(feature = "image")]
@@ -56,10 +59,12 @@ pub use sandbox::{
 };
 pub use result::{renames, Change, ChangeKind, Entry, EntryKind, ExitStatus, RunResult};
 pub use pipeline::{Stage, Pipeline, Gather};
+#[cfg(feature = "cow")]
 pub use transaction::{AbortReason, Transaction, TxnDisposition, TxnError, TxnOutcome};
 // Recovery of COW branch storage that was preserved rather than reclaimed. The
 // rest of `cow` is internal; the `recovery` module is the backend-neutral path
 // these belong to, and the flat aliases here are kept for convenience.
+#[cfg(feature = "cow")]
 pub use recovery::{list_preserved, read_preserved, PreserveReason, PreservedBranch};
 // Sectioned-profile parsing types: ProfileInput is the top-level deserialization
 // target; ProgramSpec carries [program].exec/args (not a Sandbox field).

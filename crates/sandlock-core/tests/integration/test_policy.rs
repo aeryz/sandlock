@@ -170,6 +170,7 @@ fn test_icmp_default_denied() {
 }
 
 #[test]
+#[cfg(feature = "cow")]
 fn test_branch_action_defaults() {
     let p = Sandbox::builder()
         .workdir("/tmp")

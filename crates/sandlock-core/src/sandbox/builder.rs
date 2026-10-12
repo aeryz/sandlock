@@ -878,6 +878,16 @@ impl SandboxBuilder {
             ));
         }
 
+        #[cfg(not(feature = "cow"))]
+        if self.workdir.is_some() || self.fs_storage.is_some() || self.max_disk.is_some()
+            || self.on_exit.as_ref().is_some_and(|a| *a != BranchAction::Commit)
+            || self.on_error.as_ref().is_some_and(|a| *a != BranchAction::Commit)
+        {
+            return Err(SandboxError::FeatureDisabled {
+                what: "copy-on-write filesystem".into(), feature: "cow",
+            });
+        }
+
         // An image rootfs is a cache entry every sandbox of that image shares,
         // so, like the read-only layers under a Docker container, it may only
         // be the lower side of a copy-on-write branch that is thrown away.
@@ -1248,6 +1258,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    #[cfg(feature = "cow")]
     fn spec_setters_take_the_core_grammar() {
         let sb = super::SandboxBuilder::default()
             .max_memory_spec("512M")

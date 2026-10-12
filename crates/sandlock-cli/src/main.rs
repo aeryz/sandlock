@@ -5,7 +5,7 @@ use sandlock_core::profile;
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
-#[cfg(feature = "profiles")]
+#[cfg(all(feature = "profiles", feature = "cow"))]
 mod learn;
 #[derive(Parser)]
 #[command(name = "sandlock", about = "Lightweight process sandbox", version)]
@@ -419,10 +419,10 @@ async fn main() -> Result<()> {
         }
 
         Command::Learn(args) => {
-            #[cfg(feature = "profiles")]
+            #[cfg(all(feature = "profiles", feature = "cow"))]
             learn::run(args).await?;
-            #[cfg(not(feature = "profiles"))]
-            return Err(anyhow!("learning profiles requires the profiles feature"));
+            #[cfg(not(all(feature = "profiles", feature = "cow")))]
+            return Err(anyhow!("learning profiles requires the profiles and cow features"));
         }
 
         Command::Profile { action } => {

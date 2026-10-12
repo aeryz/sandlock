@@ -7,6 +7,7 @@ mod test_sandbox;
 #[path = "integration/test_determinism.rs"]
 mod test_determinism;
 
+#[cfg(feature = "cow")]
 #[path = "integration/test_cow.rs"]
 mod test_cow;
 
@@ -35,6 +36,7 @@ mod test_landlock;
 #[path = "integration/test_pipeline.rs"]
 mod test_pipeline;
 
+#[cfg(feature = "cow")]
 #[path = "integration/test_transaction.rs"]
 mod test_transaction;
 
@@ -56,6 +58,7 @@ mod test_user_mapping;
 #[path = "integration/test_chroot.rs"]
 mod test_chroot;
 
+#[cfg(feature = "cow")]
 #[path = "integration/test_branch_action.rs"]
 mod test_branch_action;
 

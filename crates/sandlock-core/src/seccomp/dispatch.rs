@@ -555,6 +555,7 @@ pub(crate) fn build_dispatch_table(
     // ------------------------------------------------------------------
     // COW filesystem interception
     // ------------------------------------------------------------------
+    #[cfg(feature = "cow")]
     if policy.cow_enabled {
         register_cow_handlers(&mut table, ctx);
     }
@@ -999,7 +1000,7 @@ fn register_chroot_handlers(
 // ============================================================
 // COW handler registration
 // ============================================================
-
+#[cfg(feature = "cow")]
 fn register_cow_handlers(table: &mut DispatchTable, ctx: &Arc<SupervisorCtx>) {
     // Helper that captures `ctx.cow` and `ctx.processes` once at table-build
     // time, then re-clones the per-handler `Arc`s on each invocation.

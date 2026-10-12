@@ -278,6 +278,7 @@ fn test_no_supervisor_exit_code() {
 /// stayed orphaned in `/tmp/sandlock-cow-*/upper/` and never appeared
 /// in the workdir, even though the default `on_exit` is `commit`.
 #[test]
+#[cfg(feature = "cow")]
 fn test_cow_commit_runs_on_cli_exit() {
     let workdir = tempfile::tempdir().expect("tempdir");
     let sentinel = workdir.path().join("sentinel.txt");
@@ -367,7 +368,7 @@ fn test_uid_mapping_arbitrary_uid() {
 /// `sandlock run --profile-file` prints a hint to stderr suggesting
 /// `sandlock learn --merge` when the sandboxed process exits non-zero.
 #[test]
-#[cfg(feature = "profiles")]
+#[cfg(all(feature = "profiles", feature = "cow"))]
 fn test_run_denial_hint_on_nonzero_exit() {
     let profile = tempfile::NamedTempFile::new().expect("tempfile");
     let profile_path = profile.path().to_str().unwrap().to_owned();
@@ -699,6 +700,7 @@ fn test_help_shows_ps_and_inspect() {
 /// `--dry-run` is a run with both branch actions forced to `abort`: the
 /// change list is reported on stderr and nothing lands in the workdir.
 #[test]
+#[cfg(feature = "cow")]
 fn test_dry_run_reports_changes_and_writes_nothing() {
     let workdir = tempfile::tempdir().expect("tempdir");
     let sentinel = workdir.path().join("planned.txt");

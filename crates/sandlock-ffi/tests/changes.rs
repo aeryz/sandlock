@@ -1,3 +1,5 @@
+#![cfg(feature = "cow")]
+
 //! The C ABI side of a change set: both sides of every change are
 //! readable as plain scalars, plus a symlink target string.
 

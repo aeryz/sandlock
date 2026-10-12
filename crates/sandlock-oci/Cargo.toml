@@ -17,10 +17,11 @@ name = "sandlock-oci"
 path = "src/main.rs"
 
 [features]
+cow = ["sandlock-core/cow"]
 profiles = ["sandlock-core/profiles"]
-image = ["sandlock-core/image"]
+image = ["cow", "sandlock-core/image"]
 checkpoint = ["sandlock-core/checkpoint"]
-default = ["http", "checkpoint", "image", "profiles"]
+default = ["http", "checkpoint", "image", "profiles", "cow"]
 http = ["sandlock-core/http"]
 
 [dependencies]
