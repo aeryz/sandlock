@@ -27,6 +27,7 @@ fn build_err(setter: Setter, value: &str) -> String {
 }
 
 #[test]
+#[cfg(feature = "cow")]
 fn setters_take_the_core_spellings() {
     let mem = CString::new("512M").unwrap();
     let disk = CString::new("1G").unwrap();

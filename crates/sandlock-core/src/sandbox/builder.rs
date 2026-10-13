@@ -744,6 +744,7 @@ impl SandboxBuilder {
     /// has not set, so explicit settings win whichever order they come in.
     /// Writes land in a copy-on-write branch that is always discarded; see
     /// `build_unchecked`.
+    #[cfg(feature = "image")]
     pub fn image(mut self, image: &crate::image::Image) -> Self {
         self.chroot = Some(image.rootfs.clone());
         self.image_rootfs = Some(image.rootfs.clone());
@@ -875,6 +876,16 @@ impl SandboxBuilder {
                  you wanted REFER enforced only where the kernel supports it)."
                     .into(),
             ));
+        }
+
+        #[cfg(not(feature = "cow"))]
+        if self.workdir.is_some() || self.fs_storage.is_some() || self.max_disk.is_some()
+            || self.on_exit.as_ref().is_some_and(|a| *a != BranchAction::Commit)
+            || self.on_error.as_ref().is_some_and(|a| *a != BranchAction::Commit)
+        {
+            return Err(SandboxError::FeatureDisabled {
+                what: "copy-on-write filesystem".into(), feature: "cow",
+            });
         }
 
         // An image rootfs is a cache entry every sandbox of that image shares,
@@ -1147,6 +1158,7 @@ impl SandboxBuilder {
             init_fn: self.init_fn,
             work_fn: self.work_fn,
             runtime: None,
+            #[cfg(feature = "checkpoint")]
             restore_skipped: Vec::new(),
         })
     }
@@ -1246,6 +1258,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    #[cfg(feature = "cow")]
     fn spec_setters_take_the_core_grammar() {
         let sb = super::SandboxBuilder::default()
             .max_memory_spec("512M")

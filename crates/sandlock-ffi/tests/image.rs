@@ -1,3 +1,5 @@
+#![cfg(feature = "image")]
+
 //! Container images through the C ABI: `sandlock_image_pull` hands back
 //! JSON that `sandlock_sandbox_builder_image` turns into a chrooted run.
 

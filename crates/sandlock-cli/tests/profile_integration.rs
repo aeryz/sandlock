@@ -1,3 +1,5 @@
+#![cfg(feature = "profiles")]
+
 use std::process::Command;
 
 fn sandlock_bin() -> Command {

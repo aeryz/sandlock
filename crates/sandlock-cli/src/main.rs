@@ -5,6 +5,7 @@ use sandlock_core::profile;
 use anyhow::{Result, anyhow};
 use std::path::PathBuf;
 
+#[cfg(all(feature = "profiles", feature = "cow"))]
 mod learn;
 #[derive(Parser)]
 #[command(name = "sandlock", about = "Lightweight process sandbox", version)]
@@ -321,12 +322,17 @@ async fn main() -> Result<()> {
                 Ok(resp) if resp.ok => {
                     if let Some(data) = resp.data {
                         if toml {
+                            #[cfg(not(feature = "profiles"))]
+                            return Err(anyhow!("TOML output requires the profiles feature"));
+                            #[cfg(feature = "profiles")]
+                            {
                             // Round-trip through ProfileInput -> TOML.
                             let profile: sandlock_core::ProfileInput =
                                 serde_json::from_value(data)
                                     .map_err(|e| anyhow!("parse config response: {}", e))?;
                             let toml_str = toml::to_string_pretty(&profile)?;
                             println!("{}", toml_str);
+                            }
                         } else {
                             let json_str = serde_json::to_string_pretty(&data)?;
                             println!("{}", json_str);
@@ -413,7 +419,10 @@ async fn main() -> Result<()> {
         }
 
         Command::Learn(args) => {
+            #[cfg(all(feature = "profiles", feature = "cow"))]
             learn::run(args).await?;
+            #[cfg(not(all(feature = "profiles", feature = "cow")))]
+            return Err(anyhow!("learning profiles requires the profiles and cow features"));
         }
 
         Command::Profile { action } => {
@@ -645,9 +654,14 @@ async fn run_command(args: RunArgs) -> Result<i32> {
 
     let image_cmd: Option<Vec<String>>;
     if let Some(ref img) = args.image {
+        #[cfg(not(feature = "image"))]
+        return Err(anyhow!("image support is disabled; enable the image feature"));
+        #[cfg(feature = "image")]
+        {
         let image = sandlock_core::image::pull(img, None).await?;
         builder = builder.image(&image);
         image_cmd = args.cmd.is_empty().then(|| image.config.default_cmd());
+        }
     } else {
         image_cmd = None;
     }

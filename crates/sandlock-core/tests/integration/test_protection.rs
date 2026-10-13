@@ -340,6 +340,7 @@ fn builder_methods_fluent_chain() {
 // ----------------------------------------------------------------------
 
 #[test]
+#[cfg(feature = "checkpoint")]
 fn protection_policy_survives_bincode_round_trip() {
     let sb = sandlock_core::Sandbox::builder()
         .disable(Protection::SignalScope)

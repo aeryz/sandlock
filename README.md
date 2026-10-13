@@ -77,6 +77,19 @@ cd python && pip install -e .
 cargo install --path crates/sandlock-cli
 ```
 
+### Optional features
+
+All five features (`http`, `checkpoint`, `image`, `profiles`, `cow`) are enabled
+by default. Build with none or select the ones you need:
+
+```bash
+cargo build --release --no-default-features
+cargo build --release --no-default-features --features http,profiles
+```
+
+See [Building Sandlock](docs/building.md) for feature dependencies and Rust
+library configuration.
+
 ## Quick Start
 
 ### CLI
@@ -181,6 +194,7 @@ confine(&confinement)?;
 
 | Document | Contents |
 |---|---|
+| [`docs/building.md`](docs/building.md) | Build commands, optional features, and minimal Rust embedding |
 | [`docs/cli.md`](docs/cli.md) | Every `sandlock run` option by example, profiles, `ps` / `inspect` / `kill` |
 | [`docs/sandbox-reference.md`](docs/sandbox-reference.md) | Every `Sandbox` field, default, and TOML key; credentials; protection opt-out |
 | [`docs/network.md`](docs/network.md) | Endpoint grammar, protocol gating, HTTP interception, bind rules, port virtualization |

@@ -41,31 +41,48 @@ jobs:
         timeout-minutes: 20
         run: cargo test --release --workspace --no-fail-fast -- --test-threads=1
 
-  rust-minimal:
-    name: Rust without optional features
+  rust-features:
+    name: Rust features (${{ matrix.feature }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [minimal, http, checkpoint, image, profiles, cow]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
-
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: features-${{ matrix.feature }}
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-      - name: Minimal build pulls in no HTTP stack
+      - name: Check production dependency graph
+        env:
+          FEATURE: ${{ matrix.feature }}
         run: |
-          if cargo tree --workspace --no-default-features -e normal --prefix none \
-              | grep -E '^(hyper|rustls|rcgen|bollard) '; then
-            exit 1
-          fi
-
-      - name: Run all tests
+          args=(--no-default-features)
+          if [ "$FEATURE" != minimal ]; then args+=(--features "$FEATURE"); fi
+          cargo tree --workspace "${args[@]}" -e normal --prefix none > /tmp/dependencies.txt
+          case "$FEATURE" in
+            minimal) forbidden='bincode|toml|tar|flate2|ruzstd|base64|walkdir|pathdiff|ring|hyper|rustls|rcgen|bollard' ;;
+            http) forbidden='bincode|toml|tar|flate2|ruzstd|walkdir|pathdiff|bollard' ;;
+            checkpoint) forbidden='toml|tar|flate2|ruzstd|walkdir|pathdiff|ring|hyper|rustls|rcgen|bollard' ;;
+            image) forbidden='bincode|toml|rcgen' ;;
+            profiles) forbidden='bincode|tar|flate2|ruzstd|walkdir|pathdiff|ring|hyper|rustls|rcgen|bollard' ;;
+            cow) forbidden='bincode|toml|tar|flate2|ruzstd|hyper|rustls|rcgen|bollard' ;;
+          esac
+          if grep -E "^($forbidden) " /tmp/dependencies.txt; then exit 1; fi
+      - name: Test selected features
         timeout-minutes: 20
-        run: cargo test --release --workspace --no-default-features --no-fail-fast -- --test-threads=1
+        env:
+          FEATURE: ${{ matrix.feature }}
+        run: |
+          case "$FEATURE" in
+            minimal) args=(--no-default-features) ;;
+            *) args=(--no-default-features --features "$FEATURE") ;;
+          esac
+          cargo test --release --workspace "${args[@]}" --no-fail-fast -- --test-threads=1
+
 
   rust-low-abi:
     name: Rust low-ABI (ubuntu-22.04)

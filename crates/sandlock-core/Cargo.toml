@@ -19,13 +19,13 @@ rand = "0.8"
 rand_chacha = "0.3"
 goblin = "0.9"
 uuid = { version = "1", features = ["v4"] }
-bincode = "1"
+bincode = { version = "1", optional = true }
 serde_json = "1"
-walkdir = "2"
-ring = "0.17"
-toml = "0.8"
+walkdir = { version = "2", optional = true }
+ring = { version = "0.17", optional = true }
+toml = { version = "0.8", optional = true }
 jiff = "0.2"
-pathdiff = "0.2"
+pathdiff = { version = "0.2", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"], optional = true }
@@ -33,23 +33,28 @@ hyper = { version = "1", features = ["server", "client", "http1"], optional = tr
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "native-tokio", "http1", "tls12", "logging"], optional = true }
-tar = "0.4"
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-ruzstd = "0.9"
-base64 = "0.22"
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
+ruzstd = { version = "0.9", optional = true }
+base64 = { version = "0.22", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 bollard = { version = "0.21", optional = true }
 futures-util = { version = "0.3", optional = true }
 
 [features]
-default = ["http"]
+cow = ["dep:walkdir", "dep:pathdiff", "dep:ring"]
+profiles = ["dep:toml"]
+image = ["cow", "dep:tar", "dep:flate2", "dep:ruzstd", "dep:base64", "dep:bollard", "dep:futures-util"]
+checkpoint = ["dep:bincode"]
+default = ["http", "checkpoint", "image", "profiles", "cow"]
 cli = ["dep:clap"]
 http = [
     "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:hyper-rustls",
-    "dep:tokio-rustls", "dep:rustls", "dep:rcgen", "dep:bollard", "dep:futures-util",
+    "dep:tokio-rustls", "dep:rustls", "dep:rcgen",
 ]
 
 [dev-dependencies]
+toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"
 rustls-pemfile = "2"

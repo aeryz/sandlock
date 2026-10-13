@@ -980,6 +980,7 @@ async fn test_chroot_write_file() {
 
 /// Directory opens under chroot + COW must stay inside the chroot.
 #[tokio::test]
+#[cfg(feature = "cow")]
 async fn test_chroot_cow_directory_open_stays_in_rootfs() {
     let rootfs = build_test_rootfs("cow-dir-open");
     let tmp_dir = rootfs.join("tmp");
@@ -1034,6 +1035,7 @@ async fn test_chroot_cow_directory_open_stays_in_rootfs() {
 
 /// chroot + COW with BranchAction::Abort discards writes
 #[tokio::test]
+#[cfg(feature = "cow")]
 async fn test_chroot_with_cow() {
     let rootfs = build_test_rootfs("cow");
     let tmp_dir = rootfs.join("tmp");
@@ -1085,6 +1087,7 @@ async fn test_chroot_with_cow() {
 /// `open(O_RDONLY)` with no preceding `stat` (rootfs-helper.c), so it drives the
 /// open path rather than short-circuiting on the (correct) stat ENOENT.
 #[tokio::test]
+#[cfg(feature = "cow")]
 async fn test_chroot_cow_read_deleted_file_is_enoent() {
     let rootfs = build_test_rootfs("cow-read-deleted");
     let tmp_dir = rootfs.join("tmp");
@@ -2028,6 +2031,7 @@ async fn test_chroot_hardlink_follow_cannot_alias_a_denied_path_under_a_mount() 
 /// pristine workdir instead. EXDEV is the kernel's own word for a link that
 /// cannot span two sides.
 #[tokio::test]
+#[cfg(feature = "cow")]
 async fn test_chroot_hardlink_into_a_branch_is_refused() {
     let rootfs = build_test_rootfs("hardlink-branch-in");
     let tmp_dir = rootfs.join("tmp");
@@ -2087,6 +2091,7 @@ async fn test_chroot_hardlink_into_a_branch_is_refused() {
 /// aliases the *lower* inode, so a write through it edits the very file the
 /// branch promised to leave alone, and the edit outlives the abort.
 #[tokio::test]
+#[cfg(feature = "cow")]
 async fn test_chroot_hardlink_out_of_a_branch_is_refused() {
     let rootfs = build_test_rootfs("hardlink-branch-out");
     let tmp_dir = rootfs.join("tmp");
@@ -2145,6 +2150,7 @@ async fn test_chroot_hardlink_out_of_a_branch_is_refused() {
 /// keep working, and it must stay in the branch: after an abort neither the
 /// second name nor the copy of the first is left in the workdir.
 #[tokio::test]
+#[cfg(feature = "cow")]
 async fn test_chroot_hardlink_within_a_branch_stays_in_the_branch() {
     let rootfs = build_test_rootfs("hardlink-branch-within");
     let tmp_dir = rootfs.join("tmp");
@@ -2201,6 +2207,7 @@ async fn test_chroot_hardlink_within_a_branch_stays_in_the_branch() {
 /// disk with its pre-delete bytes. Linking it must answer ENOENT rather than
 /// resurrect it, which is the same rule the read-open path already follows.
 #[tokio::test]
+#[cfg(feature = "cow")]
 async fn test_chroot_hardlink_to_a_file_deleted_in_the_branch_is_enoent() {
     let rootfs = build_test_rootfs("hardlink-branch-whiteout");
     let tmp_dir = rootfs.join("tmp");
@@ -2301,6 +2308,7 @@ async fn test_chroot_fchmodat2_resolves_in_rootfs() {
 /// of the rootfs: an image could read and write any host file the supervisor
 /// can, and reach the host's /proc.
 #[tokio::test]
+#[cfg(feature = "cow")]
 async fn test_chroot_cow_symlink_stays_inside_the_rootfs() {
     let rootfs = build_test_rootfs("cow-symlink");
     let host_dir = temp_dir("cow-symlink-host");

@@ -1126,6 +1126,7 @@ print('OK')
 }
 
 #[tokio::test]
+#[cfg(feature = "cow")]
 async fn test_proc_net_chroot_and_cow_aliases() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("proc")).unwrap();

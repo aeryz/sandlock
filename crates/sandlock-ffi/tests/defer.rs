@@ -1,3 +1,5 @@
+#![cfg(feature = "cow")]
+
 //! The C ABI side of `BranchAction::Defer`: a handle that outlives its wait
 //! holds the change set until `sandlock_handle_commit` / `_abort`.
 

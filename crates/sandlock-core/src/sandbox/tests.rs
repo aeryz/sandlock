@@ -387,6 +387,7 @@ fn builder_combined_http_merges_at_resolution_time() {
 
 #[cfg(feature = "http")]
 #[test]
+#[cfg(feature = "checkpoint")]
 fn outbound_mode_survives_policy_bincode_round_trip() {
     for builder in [
         Sandbox::builder()

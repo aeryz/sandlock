@@ -499,12 +499,16 @@ impl Default for ProcessIndex {
 /// lives in `PerProcessState`.
 pub struct CowState {
     /// Seccomp-based COW branch (None if COW disabled).
+    #[cfg(feature = "cow")]
     pub branch: Option<crate::cow::seccomp::SeccompCowBranch>,
 }
 
 impl CowState {
     pub fn new() -> Self {
-        Self { branch: None }
+        Self {
+            #[cfg(feature = "cow")]
+            branch: None,
+        }
     }
 }
 

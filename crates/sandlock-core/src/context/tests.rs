@@ -137,7 +137,11 @@ fn test_notif_syscalls_faccessat2() {
     assert!(nrs.contains(&(arch::SYS_FACCESSAT2 as u32)),
             "chroot notif filter must include SYS_faccessat2 (439)");
 
-    // COW mode
+}
+
+#[cfg(feature = "cow")]
+#[test]
+fn test_notif_syscalls_faccessat2_cow() {
     let policy = Sandbox::builder()
         .workdir("/tmp")
         .build()
