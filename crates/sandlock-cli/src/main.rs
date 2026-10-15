@@ -285,23 +285,31 @@ async fn main() -> Result<()> {
             } else {
                 println!("NAME                                  PID        UPTIME  STATUS      PORTS                     CMD");
                 for name in &names {
-                    // The pids need no answer from the supervisor; the rest
-                    // does, and a supervisor that does not answer is still
-                    // alive because its socket is.
-                    let (status, ports) = match sandlock_core::control::sandbox_info(name) {
-                        Ok(info) => (
+                    // The registry's main pid outlives main, so /proc is read
+                    // only while the supervisor vouches main is alive.
+                    let pid = sandlock_core::control::sandbox_pids(name).map(|p| p.child);
+                    let (status, ports, pid, uptime, cmd) = match (sandlock_core::control::sandbox_info(name), pid) {
+                        (Ok(info), _) if info.main_exited => (
                             info.mode.unwrap_or_else(|| "running".to_string()),
                             query_ports(name),
+                            "-".to_string(),
+                            "-".to_string(),
+                            "(main exited)".to_string(),
                         ),
-                        Err(_) => ("unresponsive".to_string(), "?".to_string()),
-                    };
-                    let (pid, uptime, cmd) = match sandlock_core::control::sandbox_pids(name) {
-                        Ok(pids) => (
-                            pids.child.to_string(),
-                            proc_uptime(pids.child).unwrap_or_else(|| "?".to_string()),
-                            proc_cmdline(pids.child).unwrap_or_else(|| "?".to_string()),
+                        (Ok(info), Ok(pid)) => (
+                            info.mode.unwrap_or_else(|| "running".to_string()),
+                            query_ports(name),
+                            pid.to_string(),
+                            proc_uptime(pid).unwrap_or_else(|| "?".to_string()),
+                            proc_cmdline(pid).unwrap_or_else(|| "?".to_string()),
                         ),
-                        Err(_) => ("?".to_string(), "?".to_string(), "?".to_string()),
+                        (info, pid) => (
+                            if info.is_ok() { "running" } else { "unresponsive" }.to_string(),
+                            "?".to_string(),
+                            pid.map_or_else(|_| "?".to_string(), |p| p.to_string()),
+                            "?".to_string(),
+                            "?".to_string(),
+                        ),
                     };
                     println!(
                         "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
@@ -358,30 +366,11 @@ async fn main() -> Result<()> {
                 eprintln!("sandlock: {e}");
                 std::process::exit(1);
             }
-            // Both pids come from the kernel, so this works on a supervisor
-            // that is stopped or wedged.
-            let pids = match sandlock_core::control::sandbox_pids(&name) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("sandlock: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            // Groups the sandbox created are known only to the supervisor,
-            // and a wedged one cannot answer, so the child's own group is
-            // signalled here regardless. The supervisor may sit in a
-            // different group, so signal it directly too.
-            let _ = sandlock_core::control::send_control_request(
-                &name,
-                "kill",
-                serde_json::Value::Object(Default::default()),
-            );
-            unsafe { libc::killpg(pids.child, libc::SIGKILL) };
-            unsafe { libc::kill(pids.supervisor, libc::SIGKILL) };
-            println!(
-                "Killed sandbox '{}' (child PID {}, supervisor PID {})",
-                name, pids.child, pids.supervisor
-            );
+            if let Err(e) = sandlock_core::control::kill_sandbox(&name) {
+                eprintln!("sandlock: kill '{}': {}", name, e);
+                std::process::exit(1);
+            }
+            println!("Killed sandbox '{}'", name);
         }
 
         Command::Check => {

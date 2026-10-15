@@ -2225,7 +2225,7 @@ impl Sandbox {
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
 
-        let control_info = crate::control::SandboxInfo { mode: self.mode.clone() };
+        let control_info = crate::control::SandboxInfo { mode: self.mode.clone(), main_exited: false };
 
         let is_nested_mode = notif_fd_num == 0;
 
@@ -2479,6 +2479,7 @@ impl Sandbox {
                 self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                     sockets,
                     Some(control_ctx),
+                    self.controller()?,
                     sandbox_snapshot,
                     control_info.clone(),
                 ));
@@ -2504,6 +2505,7 @@ impl Sandbox {
             self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                 sockets,
                 None,
+                self.controller()?,
                 self.clone(),
                 control_info,
             ));

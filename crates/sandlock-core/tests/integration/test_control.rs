@@ -875,3 +875,56 @@ async fn test_control_cancelled_creation_releases_its_name() {
     assert!(!sandlock_core::control::list_sandboxes().unwrap().contains(&name));
     drop(cancelled);
 }
+
+/// A session can outlive its main process, whose pid is then free for
+/// reuse; ps must stop reporting it instead of reading a recycled /proc entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_ps_hides_the_pid_of_an_exited_main() {
+    let name = format!("test-ctrl-main-exited-{}", std::process::id());
+    let mut sb = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .build()
+        .unwrap()
+        .with_name(&name);
+    sb.spawn(&["sh", "-c", "sleep 60 & exit 0"]).await.unwrap();
+    sb.wait().await.unwrap();
+    assert!(sandlock_core::control::sandbox_info(&name).expect("info").main_exited);
+    let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout.lines().find(|l| l.starts_with(&name)).expect("ps lists the session");
+    assert_eq!(row.split_whitespace().nth(1), Some("-"), "exited main has no pid: {row}");
+    assert!(row.ends_with("(main exited)"), "{row}");
+    sb.shutdown().await.unwrap();
+}
+
+/// A host in shutdown drops its control socket mid-request; kill must not
+/// take the host down for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_kill_does_not_kill_a_host_in_teardown() {
+    let name = format!("test-ctrl-teardown-{}", std::process::id());
+    let mut sb = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .build()
+        .unwrap()
+        .with_name(&name);
+    sb.spawn(&["sleep", "60"]).await.unwrap();
+    let killer = std::thread::spawn({
+        let name = name.clone();
+        move || {
+            for _ in 0..50 {
+                let _ = sandlock_core::control::kill_sandbox(&name);
+            }
+        }
+    });
+    sb.shutdown().await.unwrap();
+    killer.join().unwrap();
+    // Reaching this line means the host survived every kill attempt.
+}
