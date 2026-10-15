@@ -622,7 +622,6 @@ pub async fn run(args: LearnArgs) -> Result<()> {
     let mut sandbox = policy;
     sandbox.create_interactive(&cmd_refs).await
         .map_err(|e| anyhow!("sandbox error: {e}"))?;
-    let child_pid = sandbox.pid().expect("child pid after create") as u32;
     sandbox.start()
         .map_err(|e| anyhow!("sandbox error: {e}"))?;
 
@@ -636,11 +635,8 @@ pub async fn run(args: LearnArgs) -> Result<()> {
                 false
             }
             Err(_elapsed) => {
-                // Timeout: kill the child, drain the supervisor, write a partial profile.
+                // The shutdown below kills the session; the profile is partial.
                 eprintln!("sandlock learn: timeout after {secs}s, killing process");
-                unsafe { libc::kill(child_pid as i32, libc::SIGKILL); }
-                // Drain without timeout so the supervisor releases its resources cleanly.
-                let _ = sandbox.wait().await;
                 true
             }
         }
