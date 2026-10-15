@@ -47,9 +47,25 @@ impl ProcessGroups {
             .map(|leaders| {
                 leaders
                     .get(&pgid)
-                    .is_some_and(|leader| pidfd_signal_group(leader, 0).is_ok())
+                    .is_some_and(|leader| signal_group(pgid, leader, 0).is_ok())
             })
             .unwrap_or(false)
+    }
+
+    /// Sorted pgids that still have members.
+    pub fn live(&self) -> io::Result<Vec<i32>> {
+        let leaders = self.leaders.lock()
+            .map_err(|_| io::Error::other("process group table poisoned"))?;
+        let mut groups = Vec::new();
+        for (&pgid, leader) in leaders.iter() {
+            match signal_group(pgid, leader, 0) {
+                Ok(()) => groups.push(pgid),
+                Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        groups.sort_unstable();
+        Ok(groups)
     }
 
     /// Signal every group, returning how many had members. Holding the lock
@@ -62,7 +78,7 @@ impl ProcessGroups {
             .map_err(|_| io::Error::other("process group table poisoned"))?;
         let mut reached = 0;
         let mut failure = None;
-        leaders.retain(|_, leader| match pidfd_signal_group(leader, sig) {
+        leaders.retain(|&pgid, leader| match signal_group(pgid, leader, sig) {
             Ok(()) => {
                 reached += 1;
                 true
@@ -88,7 +104,23 @@ impl Default for ProcessGroups {
     }
 }
 
-fn has_exited(pidfd: RawFd) -> bool {
+/// Kernels before 6.9 refuse group signals by pidfd. While the key process
+/// has not exited it holds the number, so no other group can have taken it.
+/// After that only a probe finding no group at all is conclusive, since an
+/// empty group can never regain members.
+fn signal_group(pgid: i32, key: &OwnedFd, sig: i32) -> io::Result<()> {
+    let refused = match pidfd_signal_group(key, sig) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => e,
+        result => return result,
+    };
+    let reachable = !has_exited(key.as_raw_fd());
+    if unsafe { libc::kill(-pgid, if reachable { sig } else { 0 }) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if reachable { Ok(()) } else { Err(refused) }
+}
+
+pub(crate) fn has_exited(pidfd: RawFd) -> bool {
     let mut pfd = libc::pollfd {
         fd: pidfd,
         events: libc::POLLIN,
@@ -257,6 +289,69 @@ mod tests {
 
         unsafe { libc::kill(leader, libc::SIGKILL) };
         reap(leader);
+    }
+
+    /// Runs `f` in a child whose kernel appears to predate group pidfd signals.
+    fn on_old_kernel(f: impl FnOnce() -> bool) -> bool {
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            let filter = [
+                libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 0 },
+                libc::sock_filter { code: 0x15, jt: 0, jf: 3, k: libc::SYS_pidfd_send_signal as u32 },
+                libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 16 + 3 * 8 },
+                libc::sock_filter { code: 0x45, jt: 0, jf: 1, k: 1 << 2 },
+                libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32 },
+                libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW },
+            ];
+            let prog = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr() as *mut _ };
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog);
+                libc::_exit(if f() { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+
+    #[test]
+    fn old_kernel_signals_a_group_whose_leader_lives() {
+        assert!(on_old_kernel(|| {
+            let (leader, member) = spawn_group(true);
+            let groups = ProcessGroups::new();
+            groups.track(leader, pidfd_open(leader as u32, 0).unwrap());
+            let reached = groups.live().unwrap() == [leader] && groups.signal(libc::SIGKILL).unwrap() == 1;
+            reap(leader);
+            wait_gone(member.unwrap());
+            reached
+        }));
+    }
+
+    #[test]
+    fn old_kernel_drops_an_empty_group_whose_leader_is_gone() {
+        assert!(on_old_kernel(|| {
+            let (leader, _) = spawn_group(false);
+            let groups = ProcessGroups::new();
+            groups.track(leader, pidfd_open(leader as u32, 0).unwrap());
+            unsafe { libc::kill(leader, libc::SIGKILL) };
+            reap(leader);
+            groups.signal(libc::SIGKILL).unwrap() == 0 && groups.live().unwrap().is_empty()
+        }));
+    }
+
+    #[test]
+    fn old_kernel_reports_a_populated_group_whose_leader_is_gone() {
+        assert!(on_old_kernel(|| {
+            let (leader, member) = spawn_group(true);
+            let groups = ProcessGroups::new();
+            groups.track(leader, pidfd_open(leader as u32, 0).unwrap());
+            unsafe { libc::kill(leader, libc::SIGKILL) };
+            reap(leader);
+            let refused = groups.signal(libc::SIGKILL).map_err(|e| e.raw_os_error()) == Err(Some(libc::EINVAL));
+            unsafe { libc::kill(member.unwrap(), libc::SIGKILL) };
+            refused
+        }));
     }
 
     #[test]
