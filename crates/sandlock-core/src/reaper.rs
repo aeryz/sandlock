@@ -150,16 +150,30 @@ unsafe fn supervise(main: i32, group: i32, status_fd: i32, finish_fd: i32, signa
             }
         }
         libc::poll(poll.as_mut_ptr(), 3, -1);
-        if poll[0].revents != 0 {
+        // Owner death also closes its end of the finish pipe, so it must be
+        // seen first; EOF alone likewise means nobody can finish or join.
+        if poll[2].revents != 0 || (poll[0].revents != 0 && !read_finish(finish_fd)) {
+            libc::kill(-group, libc::SIGKILL);
             libc::_exit(0);
         }
-        if poll[2].revents != 0 {
-            libc::kill(-group, libc::SIGKILL);
+        if poll[0].revents != 0 {
             libc::_exit(0);
         }
         if poll[1].revents != 0 {
             let mut info: libc::signalfd_siginfo = std::mem::zeroed();
             libc::read(signal_fd, (&mut info as *mut libc::signalfd_siginfo).cast(), std::mem::size_of_val(&info));
+        }
+    }
+}
+
+/// True for the finish byte, false for EOF.
+unsafe fn read_finish(fd: i32) -> bool {
+    let mut byte = 0u8;
+    loop {
+        match libc::read(fd, (&mut byte as *mut u8).cast(), 1) {
+            1 => return true,
+            -1 if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => {}
+            _ => return false,
         }
     }
 }
@@ -293,13 +307,12 @@ mod tests {
         assert_eq!(unsafe { libc::kill(job, libc::SIGKILL) }, 0);
     }
 
+    /// The owner is a re-executed copy of this test, so its death can be
+    /// observed here without running Rust code in a forked child.
     #[test]
     fn owner_death_kills_group_r() {
-        let mut pipe = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        // The owner is a forked helper so its death can be observed here.
-        let owner = unsafe { libc::fork() };
-        if owner == 0 {
+        const OWNER: &str = "SANDLOCK_TEST_REAPER_OWNER";
+        if std::env::var_os(OWNER).is_some() {
             let (main, reaper) = fork().unwrap();
             if main == 0 {
                 unsafe {
@@ -310,19 +323,25 @@ mod tests {
                     libc::_exit(0);
                 }
             }
-            let group = reaper.unwrap().pid;
-            unsafe {
-                libc::write(pipe[1], (&group as *const i32).cast(), 4);
-                libc::_exit(0);
-            }
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = writeln!(out, "group={}", reaper.unwrap().pid);
+            let _ = out.flush();
+            unsafe { libc::_exit(0) }
         }
-        let mut group = 0i32;
-        assert_eq!(unsafe { libc::read(pipe[0], (&mut group as *mut i32).cast(), 4) }, 4);
-        unsafe {
-            libc::close(pipe[0]);
-            libc::close(pipe[1]);
-            libc::waitpid(owner, std::ptr::null_mut(), 0);
-        }
+        let mut owner = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["reaper::tests::owner_death_kills_group_r", "--exact", "--nocapture"])
+            .env(OWNER, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Read only up to the report: concurrent forks in this test binary
+        // may hold the pipe's write end, so EOF can come late.
+        let group: i32 = std::io::BufRead::lines(std::io::BufReader::new(owner.stdout.take().unwrap()))
+            .find_map(|l| l.ok()?.strip_prefix("group=")?.parse().ok())
+            .expect("owner reported group R");
+        owner.wait().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while unsafe { libc::kill(-group, 0) } == 0 {
             assert!(std::time::Instant::now() < deadline, "group R outlived its owner");
