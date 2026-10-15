@@ -2655,7 +2655,7 @@ impl Drop for Sandbox {
         if let Some(ref mut rt) = self.runtime {
             if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
             if let Some(pid) = rt.child_pid {
-                if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
+                if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused | RuntimeState::MainExited(_)) {
                     let swept = rt.groups.signal(libc::SIGKILL);
                     if let Some(mut reaper) = rt.reaper.take() {
                         if no_supervisor || swept.is_err() { reaper.finish(); }

@@ -287,3 +287,23 @@ async fn test_drop_after_wait_ends_jobs() {
     drop(sb);
     assert!(wait_gone(job));
 }
+
+/// Dropping the sandbox after wait() must also reach jobs that left main's
+/// group, not only those the reaper can kill by itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drop_after_wait_ends_jobs_in_other_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("leader");
+    let script = format!(
+        "import os, signal\npid = os.fork()\nif pid == 0:\n    os.setsid()\n    signal.pause()\nopen('{p}.tmp', 'w').write(str(pid))\nos.rename('{p}.tmp', '{p}')\n",
+        p = pid_file.display()
+    );
+    let mut sb = policy();
+    sb.fs_writable.push(dir.path().to_path_buf());
+    sb.spawn(&["python3", "-c", &script]).await.unwrap();
+    sb.wait().await.unwrap();
+    let leader: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    assert!(alive(leader), "the setsid job survives wait()");
+    drop(sb);
+    assert!(wait_gone(leader), "Drop must end jobs in groups the sandbox created");
+}
