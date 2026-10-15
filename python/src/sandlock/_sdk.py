@@ -313,11 +313,18 @@ _lib.sandlock_start.argtypes = [_c_handle_p]
 _lib.sandlock_handle_pid.restype = ctypes.c_int
 _lib.sandlock_handle_pid.argtypes = [_c_handle_p]
 
-_lib.sandlock_handle_wait.restype = _c_result_p
-_lib.sandlock_handle_wait.argtypes = [_c_handle_p]
+_lib.sandlock_handle_wait.restype = ctypes.c_int
+_lib.sandlock_handle_wait.argtypes = [_c_handle_p, ctypes.c_uint64, ctypes.POINTER(_c_result_p)]
 
-_lib.sandlock_handle_wait_timeout.restype = _c_result_p
-_lib.sandlock_handle_wait_timeout.argtypes = [_c_handle_p, ctypes.c_uint64]
+_lib.sandlock_handle_shutdown.restype = _c_result_p
+_lib.sandlock_handle_shutdown.argtypes = [_c_handle_p]
+
+_lib.sandlock_handle_process_groups.restype = ctypes.c_void_p
+_lib.sandlock_handle_process_groups.argtypes = [_c_handle_p]
+
+for _name in ("sandlock_handle_kill", "sandlock_handle_pause", "sandlock_handle_resume"):
+    getattr(_lib, _name).restype = ctypes.c_int
+    getattr(_lib, _name).argtypes = [_c_handle_p]
 
 _lib.sandlock_handle_free.restype = None
 _lib.sandlock_handle_free.argtypes = [_c_handle_p]
@@ -904,7 +911,16 @@ class ExitReason(IntEnum):
     KILLED = 2
     """Killed with no recoverable signal number."""
     TIMEOUT = 3
-    """Killed by sandlock because it exceeded its timeout."""
+    """A run exceeded its timeout and was killed."""
+
+
+@dataclass(frozen=True)
+class ExitStatus:
+    """Main-process status from ``wait()``; the session may still be running."""
+    success: bool
+    exit_code: int
+    reason: ExitReason
+    signal: int = -1
 
 
 @dataclass

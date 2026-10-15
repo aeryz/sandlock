@@ -795,6 +795,8 @@ class TestPauseResume:
         assert pid > 0
 
         sb.wait()
+        assert sb.pid == pid, "the session outlives its main process"
+        sb.shutdown()
         assert sb.pid is None
 
     def test_pause_not_running_raises(self):
@@ -1008,8 +1010,9 @@ class TestBranchAction:
         workdir.mkdir()
         p = _policy(fs_writable=[str(workdir)], workdir=str(workdir), on_exit=BranchAction.DEFER)
         p.spawn(["sh", "-c", f"echo hi > {workdir}/out.txt"])
-        result = p.wait()
-        assert result.success
+        assert p.wait().success
+        assert not p.pending, "the branch settles at shutdown, not at main's exit"
+        assert p.shutdown().success
         assert p.pending
         p.commit()
         assert (workdir / "out.txt").read_text() == "hi\n"
