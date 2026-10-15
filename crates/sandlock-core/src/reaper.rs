@@ -24,6 +24,7 @@ impl Reaper {
         }
     }
 
+    #[cfg(test)]
     pub fn exited(&self) -> bool {
         crate::pgroup::has_exited(self.pidfd.as_raw_fd())
     }

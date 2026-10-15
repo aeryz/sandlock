@@ -288,6 +288,10 @@ struct Runtime {
     state: RuntimeState,
     child_pid: Option<i32>,
     pidfd: Option<std::os::fd::OwnedFd>,
+    reaper: Option<crate::reaper::Reaper>,
+    /// Main's process group: the reaper's pid, or a clone's own pid.
+    pgid: i32,
+    main_exit: tokio::sync::watch::Receiver<Option<crate::result::ExitStatus>>,
     groups: Arc<crate::pgroup::ProcessGroups>,
     notif_handle: Option<JoinHandle<()>>,
     policy_fn_worker: Option<crate::policy_fn::PolicyFnWorker>,
@@ -1010,19 +1014,33 @@ impl Sandbox {
         // race the worker for fork events and hang it). Mirrors
         // `spawn_pid_watcher`. Falls back to a blocking `waitpid` only when no
         // pidfd is available (kernel without `pidfd_open`).
-        let exit_status = match self.rt_mut().pidfd.take() {
-            Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
-            None => wait_child_exit_blocking(pid).await,
+        let exit_status = if self.rt().reaper.is_some() {
+            let mut main_exit = self.rt().main_exit.clone();
+            let status = main_exit.wait_for(|s| s.is_some()).await
+                .map(|s| s.clone().expect("checked"))
+                .unwrap_or(crate::result::ExitStatus::Killed);
+            status
+        } else {
+            match self.rt_mut().pidfd.take() {
+                Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
+                None => wait_child_exit_blocking(pid).await,
+            }
         };
         // The sandbox ends with its main process: descendants left behind
         // would run on with every supervised syscall failing, holding the
         // caller's stdio.
-        let _ = self.rt().groups.signal(libc::SIGKILL);
+        let swept = self.rt().groups.signal(libc::SIGKILL);
+        let no_supervisor = self.no_supervisor;
+        if let Some(mut reaper) = self.rt_mut().reaper.take() {
+            // Only jobs no sweep reached can keep it alive.
+            if no_supervisor || swept.is_err() { reaper.finish(); }
+            reaper.join().await;
+        }
 
         self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
 
         if self.rt().tty_foreground_taken {
-            sandbox_restore_tty_foreground(pid);
+            sandbox_restore_tty_foreground(self.rt().pgid);
             self.rt_mut().tty_foreground_taken = false;
         }
 
@@ -1688,6 +1706,9 @@ impl Sandbox {
                 }),
                 child_pid: Some(clone_pid),
                 pidfd: None,
+                reaper: None,
+                pgid: clone_pid,
+                main_exit: tokio::sync::watch::channel(None).1,
                 groups: Arc::new(crate::pgroup::ProcessGroups::new()),
                 notif_handle: None,
                 policy_fn_worker: None,
@@ -1793,6 +1814,9 @@ impl Sandbox {
             state: RuntimeState::Created,
             child_pid: None,
             pidfd: None,
+            reaper: None,
+            pgid: 0,
+            main_exit: tokio::sync::watch::channel(None).1,
             groups: Arc::new(crate::pgroup::ProcessGroups::new()),
             notif_handle: None,
             policy_fn_worker: None,
@@ -2050,10 +2074,6 @@ impl Sandbox {
             None
         };
 
-        // Capture our PID before fork so the child can detect parent death
-        // without assuming PID 1 is always init (wrong in containers).
-        let parent_pid = unsafe { libc::getpid() };
-
         // Interactive (fully inherited) stdio on a terminal: the child will
         // take the tty foreground group, and this process must take it back
         // once the child is reaped.
@@ -2085,20 +2105,11 @@ impl Sandbox {
         };
         let child_publisher = control_socket.as_ref().and_then(|s| s.claim.as_ref()).map(|c| c.child_publisher());
 
-        let pid = crate::control::fork_without_control_fds();
-        if pid < 0 {
-            return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
-        }
+        let (pid, reaper) = crate::reaper::fork().map_err(SandboxRuntimeError::Fork)?;
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
-            // Publish only after the process group exists, before confinement denies IPC.
-            if unsafe { libc::setpgid(0, 0) } != 0 {
-                use std::io::Write;
-                let err = std::io::Error::last_os_error();
-                let _ = writeln!(std::io::stderr(), "sandlock child: setpgid: {err}");
-                unsafe { libc::_exit(127) };
-            }
+            // Publish before confinement denies IPC.
             if let Some(publisher) = child_publisher {
                 if !publisher.publish() { unsafe { libc::_exit(127); } }
             }
@@ -2172,7 +2183,6 @@ impl Sandbox {
                 keep_fds: &gather_keep_fds,
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
-                parent_pid,
                 foreground,
             });
         }
@@ -2190,14 +2200,14 @@ impl Sandbox {
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 
-        let pidfd = match syscall::pidfd_open(pid as u32, 0) {
-            Ok(fd) => Some(fd),
-            Err(_) => None,
-        };
-        // The child's first act is setpgid(0, 0), so its pid names its group.
-        if let Some(leader) = pidfd.as_ref().and_then(|pfd| pfd.try_clone().ok()) {
-            self.rt_mut().groups.track(pid, leader);
-        }
+        let mut reaper = reaper.expect("parent has a reaper");
+        let status = reaper.take_status().expect("fresh reaper");
+        let key = reaper.pidfd.try_clone().map_err(SandboxRuntimeError::Io)?;
+        self.rt_mut().groups.track(reaper.pid, key);
+        self.rt_mut().pgid = reaper.pid;
+        self.rt_mut().main_exit = spawn_main_exit_watch(status);
+        self.rt_mut().reaper = Some(reaper);
+        let pidfd = syscall::pidfd_open(pid as u32, 0).ok();
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
@@ -2595,9 +2605,9 @@ impl Process<'_> {
 /// to someone else is left alone. SIGTTOU is blocked around `tcsetpgrp`:
 /// this process is a background group at that moment, and an unblocked
 /// SIGTTOU would stop it, which is the exact symptom being prevented.
-fn sandbox_restore_tty_foreground(child_pid: i32) {
+fn sandbox_restore_tty_foreground(pgid: i32) {
     unsafe {
-        if libc::isatty(0) != 1 || libc::tcgetpgrp(0) != child_pid {
+        if libc::isatty(0) != 1 || libc::tcgetpgrp(0) != pgid {
             return;
         }
         let mut block: libc::sigset_t = std::mem::zeroed();
@@ -2616,19 +2626,23 @@ fn sandbox_restore_tty_foreground(child_pid: i32) {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        let no_supervisor = self.no_supervisor;
         if let Some(ref mut rt) = self.runtime {
             if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
             if let Some(pid) = rt.child_pid {
                 if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
-                    let _ = rt.groups.signal(libc::SIGKILL);
-                    // The waitpid below must not hang on a child whose group
-                    // was never recorded. Unreaped, its pid is still ours.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    let mut status: i32 = 0;
-                    unsafe { libc::waitpid(pid, &mut status, 0) };
+                    let swept = rt.groups.signal(libc::SIGKILL);
+                    if let Some(mut reaper) = rt.reaper.take() {
+                        if no_supervisor || swept.is_err() { reaper.finish(); }
+                        reaper.join_blocking();
+                    } else {
+                        // Unreaped, a clone's pid is still ours.
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                    }
                 }
                 if rt.tty_foreground_taken {
-                    sandbox_restore_tty_foreground(pid);
+                    sandbox_restore_tty_foreground(rt.pgid);
                     rt.tty_foreground_taken = false;
                 }
             }
@@ -2923,6 +2937,25 @@ fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = file.read_to_end(&mut buf);
     buf
+}
+
+/// Main's status arrives once on the reaper's pipe; the slot keeps it for
+/// `wait()` and for `ps`, whether or not anyone is waiting yet.
+fn spawn_main_exit_watch(
+    status: std::os::fd::OwnedFd,
+) -> tokio::sync::watch::Receiver<Option<crate::result::ExitStatus>> {
+    use tokio::io::AsyncReadExt;
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    tokio::spawn(async move {
+        let Ok(mut pipe) = tokio::net::unix::pipe::Receiver::from_owned_fd(status) else { return };
+        let mut raw = [0u8; 4];
+        let exit = match pipe.read_exact(&mut raw).await {
+            Ok(_) => sandbox_wait_status_to_exit(i32::from_le_bytes(raw)),
+            Err(_) => crate::result::ExitStatus::Killed,
+        };
+        let _ = tx.send(Some(exit));
+    });
+    rx
 }
 
 fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {

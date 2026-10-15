@@ -419,7 +419,7 @@ fn test_control_no_supervisor() {
 
             let pids = sandlock_core::control::sandbox_pids(&name).expect("pids");
             assert_eq!(pids.supervisor, child.id() as i32, "supervisor pid: {:?}", pids);
-            assert_eq!(unsafe { libc::getpgid(pids.child) }, pids.child, "child leads its group: {:?}", pids);
+            assert_ne!(unsafe { libc::getpgid(pids.child) }, pids.child, "main runs in the reaper's group: {:?}", pids);
             let info = sandlock_core::control::sandbox_info(&name).expect("info");
             assert_eq!(info.mode, None);
 

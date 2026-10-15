@@ -148,7 +148,8 @@ fn interactive_run_hands_tty_foreground_to_child_while_alive() {
                 Some(p) => p,
                 None => return EXIT_RUN_FAILED,
             };
-            if unsafe { libc::tcgetpgrp(0) } != child {
+            // The child runs in its reaper's group, not one it leads.
+            if unsafe { libc::tcgetpgrp(0) != libc::getpgid(child) } {
                 return EXIT_FOREGROUND_NOT_TAKEN;
             }
             if policy.kill().is_err() {
