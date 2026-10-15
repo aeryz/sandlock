@@ -1155,6 +1155,8 @@ pub unsafe extern "C" fn sandlock_run(
 pub struct sandlock_handle_t {
     sandbox: Sandbox,
     runtime: tokio::runtime::Runtime,
+    // Beside the Sandbox so signals need no access to it during a wait.
+    controller: Option<sandlock_core::Controller>,
 }
 
 /// Shared entry-point prologue for the create/popen family: validate the
@@ -1218,6 +1220,7 @@ unsafe fn sandlock_create_with_runtime(
     }
 
     Box::into_raw(Box::new(sandlock_handle_t {
+        controller: sb.controller().ok(),
         sandbox: sb,
         runtime: rt,
     }))
@@ -1373,6 +1376,7 @@ pub unsafe extern "C" fn sandlock_popen(
     write_or_close_fd(out_stderr_fd, err_fd.map(|f| f.into_raw_fd()).unwrap_or(-1));
 
     Box::into_raw(Box::new(sandlock_handle_t {
+        controller: sb.controller().ok(),
         sandbox: sb,
         runtime: rt,
     }))
@@ -1407,85 +1411,128 @@ pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32
     (*h).sandbox.pid().unwrap_or(0)
 }
 
-/// Send SIGKILL to the handle's entire process group. Idempotent: a process
-/// that already exited is not an error. Returns 0 on success, -1 on error.
-/// The handle remains valid; call `sandlock_handle_wait` to collect the exit
-/// status and `sandlock_handle_free` to release it.
+/// Send SIGKILL to every process group of the session. Idempotent: a session
+/// whose processes already exited is not an error. Returns 0 on success, -1
+/// on error. Safe to call while another thread is blocked in
+/// `sandlock_handle_wait`.
 ///
 /// # Safety
 /// `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
 #[no_mangle]
 pub unsafe extern "C" fn sandlock_handle_kill(h: *mut sandlock_handle_t) -> c_int {
-    if h.is_null() {
-        return -1;
+    match handle_controller(h).map(|c| c.kill()) {
+        Some(Ok(())) => 0,
+        _ => -1,
     }
-    let h = &mut *h;
-    if h.sandbox.kill().is_err() {
-        return -1;
-    }
-    0
 }
 
-/// Wait for the sandbox to exit. Returns a result handle with stdout/stderr.
-///
-/// For a `sandlock_popen` handle, close a piped `out_stdin_fd` and drain any
-/// piped `out_stdout_fd`/`out_stderr_fd` *before* calling this, or a child that
-/// reads to EOF or fills a pipe buffer never exits and this blocks forever.
+/// Send SIGSTOP to every process group of the session. Returns 0 on success,
+/// -1 on error. Safe to call while another thread is blocked in
+/// `sandlock_handle_wait`.
 ///
 /// # Safety
 /// `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_handle_wait(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
-    if h.is_null() {
-        return ptr::null_mut();
+pub unsafe extern "C" fn sandlock_handle_pause(h: *mut sandlock_handle_t) -> c_int {
+    match handle_controller(h).map(|c| c.pause()) {
+        Some(Ok(())) => 0,
+        _ => -1,
     }
-    let h = &mut *h;
-    match block_on_runtime(&h.runtime, async { h.sandbox.wait().await?; h.sandbox.shutdown().await }) {
-        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+}
+
+/// Send SIGCONT to every process group of the session. Returns 0 on success,
+/// -1 on error. Safe to call while another thread is blocked in
+/// `sandlock_handle_wait`.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_resume(h: *mut sandlock_handle_t) -> c_int {
+    match handle_controller(h).map(|c| c.resume()) {
+        Some(Ok(())) => 0,
+        _ => -1,
+    }
+}
+
+/// Sorted ids of the session's process groups that still have members, as a
+/// JSON array. Free with `sandlock_string_free`. Returns null on error. Safe
+/// to call while another thread is blocked in `sandlock_handle_wait`.
+///
+/// # Safety
+/// `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_process_groups(h: *const sandlock_handle_t) -> *mut c_char {
+    match handle_controller(h).map(|c| c.process_groups()) {
+        Some(Ok(groups)) => CString::new(serde_json::to_string(&groups).unwrap_or_default())
+            .map(CString::into_raw)
+            .unwrap_or(ptr::null_mut()),
         _ => ptr::null_mut(),
     }
 }
 
-/// Wait for the sandbox to exit with a timeout in milliseconds.
-/// Returns a result handle, or null on error. On timeout the sandbox is
-/// killed and a result with `ExitStatus::Timeout` is returned.
+unsafe fn handle_controller<'a>(h: *const sandlock_handle_t) -> Option<&'a sandlock_core::Controller> {
+    if h.is_null() { None } else { (*h).controller.as_ref() }
+}
+
+/// Wait for the main process; background jobs stay supervised. Returns 0 and
+/// a status-only result in `*status`, 1 if `timeout_ms` (0 waits forever)
+/// elapsed first and the session is untouched, or -1 on error.
+///
+/// For a `sandlock_popen` handle, close a piped `out_stdin_fd` and drain any
+/// piped `out_stdout_fd`/`out_stderr_fd` while waiting, or a child that reads
+/// to EOF or fills a pipe buffer never exits.
 ///
 /// # Safety
-/// `h` must be a valid handle from `sandlock_create`.
+/// `h` must be a valid handle, `status` a valid pointer, and no other call on
+/// `h` except kill, pause, resume and process_groups may run concurrently.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_handle_wait_timeout(
+pub unsafe extern "C" fn sandlock_handle_wait(
     h: *mut sandlock_handle_t,
     timeout_ms: u64,
-) -> *mut sandlock_result_t {
+    status: *mut *mut sandlock_result_t,
+) -> c_int {
+    if h.is_null() || status.is_null() {
+        return -1;
+    }
+    *status = ptr::null_mut();
+    let sandbox = &mut (*h).sandbox;
+    let outcome = block_on_runtime(&(*h).runtime, async {
+        if timeout_ms == 0 {
+            sandbox.wait().await.map(Some)
+        } else {
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), sandbox.wait()).await {
+                Ok(r) => r.map(Some),
+                Err(_) => Ok(None),
+            }
+        }
+    });
+    match outcome {
+        Some(Ok(Some(exit_status))) => {
+            *status = Box::into_raw(Box::new(sandlock_result_t {
+                _private: RunResult { exit_status, stdout: None, stderr: None, changes: Vec::new() },
+            }));
+            0
+        }
+        Some(Ok(None)) => 1,
+        _ => -1,
+    }
+}
+
+/// Kill what is left of the session, wait until it has no process, and return
+/// main's status with the captured output and filesystem changes. Returns
+/// null on error.
+///
+/// # Safety
+/// `h` must be a valid handle, and no other call on `h` may run concurrently.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_shutdown(h: *mut sandlock_handle_t) -> *mut sandlock_result_t {
     if h.is_null() {
         return ptr::null_mut();
     }
     let h = &mut *h;
-
-    if timeout_ms == 0 {
-        // No timeout -- same as sandlock_handle_wait.
-        return match block_on_runtime(&h.runtime, async { h.sandbox.wait().await?; h.sandbox.shutdown().await }) {
-            Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-            _ => ptr::null_mut(),
-        };
-    }
-
-    let dur = Duration::from_millis(timeout_ms);
-    match block_on_runtime(&h.runtime, async {
-        match tokio::time::timeout(dur, h.sandbox.wait()).await {
-            Ok(Ok(_)) => Ok(h.sandbox.shutdown().await),
-            Ok(Err(e)) => Ok(Err(e)),
-            Err(elapsed) => Err(elapsed),
-        }
-    }) {
-        Some(Ok(Ok(result))) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
-        Some(Ok(Err(_))) | None => ptr::null_mut(),
-        Some(Err(_)) => {
-            // Timeout -- kill the process and return a timeout result.
-            let _ = h.sandbox.kill();
-            let result = RunResult::timeout();
-            Box::into_raw(Box::new(sandlock_result_t { _private: result }))
-        }
+    match block_on_runtime(&h.runtime, h.sandbox.shutdown()) {
+        Some(Ok(result)) => Box::into_raw(Box::new(sandlock_result_t { _private: result })),
+        _ => ptr::null_mut(),
     }
 }
 
@@ -1643,7 +1690,7 @@ pub enum sandlock_exit_reason_t {
     Signaled = 1,
     /// Killed with no recoverable signal number.
     Killed = 2,
-    /// Killed by sandlock because it exceeded its timeout.
+    /// A run exceeded its timeout and was killed.
     Timeout = 3,
 }
 
@@ -2957,6 +3004,7 @@ pub unsafe extern "C" fn sandlock_restore_interactive(
         return ptr::null_mut();
     }
     Box::into_raw(Box::new(sandlock_handle_t {
+        controller: sb.controller().ok(),
         sandbox: sb,
         runtime: rt,
     }))

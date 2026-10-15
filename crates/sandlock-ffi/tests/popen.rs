@@ -11,7 +11,7 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::ptr;
 
 use sandlock_ffi::{
-    sandlock_handle_free, sandlock_handle_kill, sandlock_handle_wait, sandlock_popen,
+    sandlock_handle_free, sandlock_handle_kill, sandlock_popen,
     sandlock_result_exit_code, sandlock_result_free, sandlock_result_success,
     sandlock_sandbox_build, sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_new,
     sandlock_sandbox_free, sandlock_sandbox_t,
@@ -76,7 +76,7 @@ fn popen_streams_stdout_and_collects_exit() {
         .unwrap();
     assert_eq!(out, "ffi-hi\n");
 
-    let res = unsafe { sandlock_handle_wait(h) };
+    let res = unsafe { finish(h) };
     assert!(!res.is_null());
     assert_eq!(unsafe { sandlock_result_exit_code(res) }, 0);
     unsafe {
@@ -120,7 +120,7 @@ fn popen_stdin_stdout_roundtrip() {
     stdout.read_to_string(&mut out).unwrap();
     assert_eq!(out, "ping\n");
 
-    let res = unsafe { sandlock_handle_wait(h) };
+    let res = unsafe { finish(h) };
     assert_eq!(unsafe { sandlock_result_exit_code(res) }, 0);
     unsafe {
         sandlock_result_free(res);
@@ -153,7 +153,7 @@ fn popen_null_mode_yields_no_fd() {
     };
     assert!(!h.is_null());
     assert_eq!(fd_out, -1, "Null stdout yields no caller fd");
-    let res = unsafe { sandlock_handle_wait(h) };
+    let res = unsafe { finish(h) };
     assert_eq!(unsafe { sandlock_result_exit_code(res) }, 0);
     unsafe {
         sandlock_result_free(res);
@@ -194,7 +194,7 @@ fn popen_stderr_piped_through_ffi() {
         .unwrap();
     assert_eq!(out, "err\n");
 
-    let res = unsafe { sandlock_handle_wait(h) };
+    let res = unsafe { finish(h) };
     assert_eq!(unsafe { sandlock_result_exit_code(res) }, 0);
     unsafe {
         sandlock_result_free(res);
@@ -230,7 +230,7 @@ fn popen_kill_then_wait_then_free() {
     assert!(!h.is_null());
 
     assert_eq!(unsafe { sandlock_handle_kill(h) }, 0, "kill should succeed");
-    let res = unsafe { sandlock_handle_wait(h) };
+    let res = unsafe { finish(h) };
     assert!(!res.is_null(), "wait must still return after kill");
     assert!(
         !unsafe { sandlock_result_success(res) },
@@ -307,7 +307,7 @@ fn popen_kill_is_idempotent() {
         0,
         "second kill must be idempotent"
     );
-    let res = unsafe { sandlock_handle_wait(h) };
+    let res = unsafe { finish(h) };
     unsafe {
         sandlock_result_free(res);
         sandlock_handle_free(h);
@@ -389,7 +389,7 @@ fn popen_piped_stream_with_null_out_ptr_is_closed_not_leaked() {
         );
         assert_eq!(fd_in, -1, "stdin inherited → no fd");
         assert_eq!(fd_err, -1, "stderr inherited → no fd");
-        let res = unsafe { sandlock_handle_wait(h) };
+        let res = unsafe { finish(h) };
         unsafe {
             sandlock_result_free(res);
             sandlock_handle_free(h);
@@ -409,4 +409,12 @@ fn popen_piped_stream_with_null_out_ptr_is_closed_not_leaked() {
         "process fd count grew across iterations (min={min}, max={max}) — a PIPED \
          stream with a null out-pointer is leaking its fd instead of being closed"
     );
+}
+
+/// Wait for main, then end the session and return the full result.
+unsafe fn finish(h: *mut sandlock_ffi::sandlock_handle_t) -> *mut sandlock_ffi::sandlock_result_t {
+    let mut status = std::ptr::null_mut();
+    assert_eq!(sandlock_ffi::sandlock_handle_wait(h, 0, &mut status), 0);
+    sandlock_ffi::sandlock_result_free(status);
+    sandlock_ffi::sandlock_handle_shutdown(h)
 }

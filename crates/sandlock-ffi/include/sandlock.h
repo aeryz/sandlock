@@ -70,7 +70,7 @@ enum sandlock_exit_reason
    */
   SANDLOCK_EXIT_REASON_KILLED = 2,
   /**
-   * Killed by sandlock because it exceeded its timeout.
+   * A run exceeded its timeout and was killed.
    */
   SANDLOCK_EXIT_REASON_TIMEOUT = 3,
 };
@@ -877,10 +877,10 @@ int sandlock_start(sandlock_handle_t *h);
 int32_t sandlock_handle_pid(const sandlock_handle_t *h);
 
 /**
- * Send SIGKILL to the handle's entire process group. Idempotent: a process
- * that already exited is not an error. Returns 0 on success, -1 on error.
- * The handle remains valid; call `sandlock_handle_wait` to collect the exit
- * status and `sandlock_handle_free` to release it.
+ * Send SIGKILL to every process group of the session. Idempotent: a session
+ * whose processes already exited is not an error. Returns 0 on success, -1
+ * on error. Safe to call while another thread is blocked in
+ * `sandlock_handle_wait`.
  *
  * # Safety
  * `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
@@ -888,26 +888,59 @@ int32_t sandlock_handle_pid(const sandlock_handle_t *h);
 int sandlock_handle_kill(sandlock_handle_t *h);
 
 /**
- * Wait for the sandbox to exit. Returns a result handle with stdout/stderr.
- *
- * For a `sandlock_popen` handle, close a piped `out_stdin_fd` and drain any
- * piped `out_stdout_fd`/`out_stderr_fd` *before* calling this, or a child that
- * reads to EOF or fills a pipe buffer never exits and this blocks forever.
+ * Send SIGSTOP to every process group of the session. Returns 0 on success,
+ * -1 on error. Safe to call while another thread is blocked in
+ * `sandlock_handle_wait`.
  *
  * # Safety
  * `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
  */
-sandlock_result_t *sandlock_handle_wait(sandlock_handle_t *h);
+int sandlock_handle_pause(sandlock_handle_t *h);
 
 /**
- * Wait for the sandbox to exit with a timeout in milliseconds.
- * Returns a result handle, or null on error. On timeout the sandbox is
- * killed and a result with `ExitStatus::Timeout` is returned.
+ * Send SIGCONT to every process group of the session. Returns 0 on success,
+ * -1 on error. Safe to call while another thread is blocked in
+ * `sandlock_handle_wait`.
  *
  * # Safety
- * `h` must be a valid handle from `sandlock_create`.
+ * `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
  */
-sandlock_result_t *sandlock_handle_wait_timeout(sandlock_handle_t *h, uint64_t timeout_ms);
+int sandlock_handle_resume(sandlock_handle_t *h);
+
+/**
+ * Sorted ids of the session's process groups that still have members, as a
+ * JSON array. Free with `sandlock_string_free`. Returns null on error. Safe
+ * to call while another thread is blocked in `sandlock_handle_wait`.
+ *
+ * # Safety
+ * `h` must be a valid handle from `sandlock_create` / `sandlock_popen`.
+ */
+char *sandlock_handle_process_groups(const sandlock_handle_t *h);
+
+/**
+ * Wait for the main process; background jobs stay supervised. Returns 0 and
+ * a status-only result in `*status`, 1 if `timeout_ms` (0 waits forever)
+ * elapsed first and the session is untouched, or -1 on error.
+ *
+ * For a `sandlock_popen` handle, close a piped `out_stdin_fd` and drain any
+ * piped `out_stdout_fd`/`out_stderr_fd` while waiting, or a child that reads
+ * to EOF or fills a pipe buffer never exits.
+ *
+ * # Safety
+ * `h` must be a valid handle, `status` a valid pointer, and no other call on
+ * `h` except kill, pause, resume and process_groups may run concurrently.
+ */
+int sandlock_handle_wait(sandlock_handle_t *h, uint64_t timeout_ms, sandlock_result_t **status);
+
+/**
+ * Kill what is left of the session, wait until it has no process, and return
+ * main's status with the captured output and filesystem changes. Returns
+ * null on error.
+ *
+ * # Safety
+ * `h` must be a valid handle, and no other call on `h` may run concurrently.
+ */
+sandlock_result_t *sandlock_handle_shutdown(sandlock_handle_t *h);
 
 /**
  * Get port mappings as a JSON string (e.g. `{"80":9001,"443":9002}`).

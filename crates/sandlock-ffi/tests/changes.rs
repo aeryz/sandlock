@@ -10,7 +10,6 @@ use std::ptr;
 
 use sandlock_ffi::{
     sandlock_create_for_run, sandlock_entry_kind_t, sandlock_entry_t, sandlock_handle_free,
-    sandlock_handle_wait,
     sandlock_result_change_entry, sandlock_result_change_path,
     sandlock_result_change_target, sandlock_result_changes_len, sandlock_result_free,
     sandlock_result_success, sandlock_sandbox_build, sandlock_sandbox_builder_cwd,
@@ -94,7 +93,7 @@ fn both_sides_of_every_change_are_readable() {
     unsafe { sandlock_sandbox_free(policy) };
     assert!(!h.is_null());
     assert_eq!(unsafe { sandlock_start(h) }, 0);
-    let r = unsafe { sandlock_handle_wait(h) };
+    let r = unsafe { finish(h) };
     assert!(unsafe { sandlock_result_success(r) });
 
     let n = unsafe { sandlock_result_changes_len(r) };
@@ -136,4 +135,12 @@ fn both_sides_of_every_change_are_readable() {
 
     unsafe { sandlock_result_free(r) };
     unsafe { sandlock_handle_free(h) };
+}
+
+/// Wait for main, then end the session and return the full result.
+unsafe fn finish(h: *mut sandlock_ffi::sandlock_handle_t) -> *mut sandlock_ffi::sandlock_result_t {
+    let mut status = std::ptr::null_mut();
+    assert_eq!(sandlock_ffi::sandlock_handle_wait(h, 0, &mut status), 0);
+    sandlock_ffi::sandlock_result_free(status);
+    sandlock_ffi::sandlock_handle_shutdown(h)
 }
