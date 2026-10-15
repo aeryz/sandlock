@@ -138,7 +138,7 @@ async fn test_restore_glibc_vdso_program_resumes() {
 
     // Kill the original so only the restored process can advance the file.
     sb.kill().unwrap();
-    let _ = sb.wait().await;
+    let _ = async { sb.wait().await?; sb.shutdown().await }.await;
 
     // Sentinel: prove the *restored* process (not a leftover original) is writing.
     std::fs::write(&counter, b"0\n").unwrap();
@@ -168,7 +168,7 @@ async fn test_restore_glibc_vdso_program_resumes() {
 
     // Clean up before asserting so a failure never leaks the child/files.
     let _ = sb2.kill();
-    let exit = sb2.wait().await.map(|r| r.exit_status);
+    let exit = async { sb2.wait().await?; sb2.shutdown().await }.await.map(|r| r.exit_status);
     let _ = std::fs::remove_dir_all(&tmp);
 
     assert!(
@@ -251,7 +251,7 @@ async fn test_restore_resumes_inside_a_chroot() {
     let cp = sb.checkpoint().await.unwrap();
     let baseline = read_counter().expect("counter file should exist with a value");
     sb.kill().unwrap();
-    let _ = sb.wait().await;
+    let _ = async { sb.wait().await?; sb.shutdown().await }.await;
 
     std::fs::write(&counter, b"0\n").unwrap();
     let mut sb2 = policy.clone().with_name("chroot-restore-dst");
@@ -267,7 +267,7 @@ async fn test_restore_resumes_inside_a_chroot() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let _ = sb2.kill();
-    let _ = sb2.wait().await;
+    let _ = async { sb2.wait().await?; sb2.shutdown().await }.await;
     let _ = std::fs::remove_dir_all(&rootfs);
 
     restored.expect("restore under chroot");

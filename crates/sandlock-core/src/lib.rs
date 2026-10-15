@@ -44,12 +44,14 @@ pub mod fork;
 pub(crate) mod ca_inject;
 pub(crate) mod chroot;
 pub mod control;
+pub mod controller;
 #[cfg(feature = "http")]
 mod transparent_proxy;
 #[cfg(not(feature = "http"))]
 #[path = "transparent_proxy/disabled.rs"]
 mod transparent_proxy;
 
+pub use controller::Controller;
 pub use error::SandlockError;
 pub use policy_fn::PolicyFn;
 pub use sys::structs::{SeccompData, SeccompNotif};
