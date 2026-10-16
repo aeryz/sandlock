@@ -1073,3 +1073,56 @@ async fn exec_with_live_sibling_thread_completes() {
     .expect("exec hung behind a frozen sibling thread");
     assert!(result.unwrap().success());
 }
+
+/// A deferred callback keeps the connect's approval and answers it only
+/// when a later event arrives, which needs both the callback thread and
+/// the supervisor to keep going while the connect is held.
+#[tokio::test]
+async fn deferred_approval_resolved_by_later_event() {
+    let marker = temp_file("deferred-marker");
+    let _ = std::fs::remove_dir(&marker);
+    let out = temp_file("deferred-out");
+    let (_listener, port) = loopback_listener("127.0.0.1");
+    let held: Arc<Mutex<Option<sandlock_core::policy_fn::Approval>>> = Arc::new(Mutex::new(None));
+    let marker_name = marker.file_name().unwrap().to_owned();
+
+    let policy = base_policy()
+        .net_allow(format!("127.0.0.1:{port}"))
+        .policy_fn(PolicyFn::deferred(move |event, _ctx, approval| {
+            if event.syscall == "connect" && event.port == Some(port) {
+                *held.lock().unwrap() = approval;
+                return;
+            }
+            if event.syscall == "mkdirat"
+                && event.path.as_ref().and_then(|p| p.file_name()) == Some(&marker_name)
+            {
+                if let Some(connect) = held.lock().unwrap().take() {
+                    connect.allow();
+                }
+            }
+            if let Some(approval) = approval {
+                approval.allow();
+            }
+        }))
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import os, socket, threading, time\n",
+        "def dial():\n",
+        "  socket.create_connection(('127.0.0.1', {port}), timeout=10)\n",
+        "  open('{out}', 'w').write('CONNECTED')\n",
+        "t = threading.Thread(target=dial)\n",
+        "t.start()\n",
+        "time.sleep(0.2)\n",
+        "os.mkdir('{marker}')\n",
+        "t.join()\n",
+    ), port = port, marker = marker.display(), out = out.display());
+
+    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_dir(&marker);
+    let _ = std::fs::remove_file(&out);
+    assert!(result.success());
+    assert_eq!(content, "CONNECTED");
+}
