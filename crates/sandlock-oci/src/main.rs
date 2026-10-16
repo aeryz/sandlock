@@ -723,17 +723,13 @@ fn cmd_kill(id: &str, signal: &str, all: bool) -> Result<()> {
     let signum = parse_signal(signal)?;
 
     if all {
-        // For group-wide signals, ask the daemon to killpg so it uses the
-        // correct pgid (sandlock-init's pid, not the workload's). Fall back
-        // to a direct killpg if the daemon is unreachable (already exited).
-        let sent = supervisor::send_command(
+        // Only the daemon knows the session's groups: init does not lead
+        // one, so its pid names no group. A daemon that is gone took the
+        // session with it, since its reaper kills the session on owner death.
+        let _ = supervisor::send_command(
             id,
             supervisor::SupervisorCmd::Signal { signum },
         );
-        if sent.is_err() {
-            // Daemon gone: best-effort direct killpg on the recorded pid.
-            unsafe { libc::killpg(state.pid, signum) };
-        }
     } else {
         let ret = unsafe { libc::kill(state.pid, signum) };
         if ret < 0 {
@@ -768,15 +764,10 @@ fn cmd_delete(id: &str, force: bool) -> Result<()> {
     }
 
     // If running with --force, ask the daemon to shutdown (it sends Shutdown to
-    // sandlock-init, which killpg's its group and exits). This correctly targets
-    // the process group even when state.pid is the workload (not the pgid).
-    // Fall back to a direct killpg if the daemon is already gone.
+    // sandlock-init, which killpg's its group and exits). A daemon that is
+    // already gone took the session with it.
     if state.status == Status::Running && state.pid > 0 && state.is_alive() {
-        let sent = supervisor::send_command(id, supervisor::SupervisorCmd::Shutdown);
-        if sent.is_err() {
-            // Daemon already gone: kill whatever we can reach.
-            unsafe { libc::killpg(state.pid, libc::SIGKILL) };
-        }
+        let _ = supervisor::send_command(id, supervisor::SupervisorCmd::Shutdown);
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
