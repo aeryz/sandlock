@@ -898,7 +898,29 @@ async fn test_control_ps_hides_the_pid_of_an_exited_main() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let row = stdout.lines().find(|l| l.starts_with(&name)).expect("ps lists the session");
     assert_eq!(row.split_whitespace().nth(1), Some("-"), "exited main has no pid: {row}");
-    assert!(row.ends_with("(main exited)"), "{row}");
+    assert!(row.ends_with("(main exited, 1 group)"), "{row}");
+    sb.shutdown().await.unwrap();
+}
+
+/// A session whose main exited alone stays listed until shutdown(); ps must
+/// tell it apart from one with jobs still running.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_ps_reports_an_idle_session() {
+    let name = format!("test-ctrl-idle-{}", std::process::id());
+    let mut sb = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .build()
+        .unwrap()
+        .with_name(&name);
+    sb.spawn(&["true"]).await.unwrap();
+    sb.wait().await.unwrap();
+    let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout.lines().find(|l| l.starts_with(&name)).expect("ps lists the session");
+    assert!(row.ends_with("(main exited, idle)"), "{row}");
     sb.shutdown().await.unwrap();
 }
 

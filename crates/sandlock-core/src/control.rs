@@ -172,6 +172,9 @@ pub struct SandboxInfo {
     /// Main's pid in the registry is free for reuse once this is set.
     #[serde(default)]
     pub main_exited: bool,
+    /// Process groups of the session that still have members.
+    #[serde(default)]
+    pub live_groups: usize,
 }
 
 /// Spawn the control-loop task. `ctx` is `None` for sandboxes without a
@@ -390,7 +393,11 @@ async fn serve_one(
 }
 
 async fn handle_info(stream: &mut ControlStream, info: &SandboxInfo, controller: &crate::Controller) {
-    let info = SandboxInfo { main_exited: controller.main_exited(), ..info.clone() };
+    let info = SandboxInfo {
+        main_exited: controller.main_exited(),
+        live_groups: controller.process_groups().map_or(0, |groups| groups.len()),
+        ..info.clone()
+    };
     let resp = match serde_json::to_value(&info) {
         Ok(data) => ControlResponse { v: 1, ok: true, data: Some(data), err: None },
         Err(e) => ControlResponse {
@@ -607,7 +614,7 @@ fn connect_entry(name: &str, entry: &ownership::Entry, my_uid: u32) -> Result<(U
 /// The sandbox's PIDs, stamped by the kernel at semaphore publication.
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxPids {
-    /// The child, which leads its own process group.
+    /// Main, whose pid is free for reuse once it has exited.
     pub child: i32,
     pub supervisor: i32,
 }
@@ -838,7 +845,7 @@ mod tests {
     }
 
     fn info() -> SandboxInfo {
-        SandboxInfo { mode: Some("test".into()), main_exited: false }
+        SandboxInfo { mode: Some("test".into()), main_exited: false, live_groups: 0 }
     }
 
     /// Bind a listener for `name`, run the control loop on it with

@@ -2233,7 +2233,7 @@ impl Sandbox {
         };
         let exec_r = take_child_fd(exec_fd_num, libc::O_RDONLY)?;
 
-        let control_info = crate::control::SandboxInfo { mode: self.mode.clone(), main_exited: false };
+        let control_info = crate::control::SandboxInfo { mode: self.mode.clone(), main_exited: false, live_groups: 0 };
 
         let is_nested_mode = notif_fd_num == 0;
 
