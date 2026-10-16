@@ -331,7 +331,7 @@ result = sandbox.run(["python3", "-c", "print(42)"], timeout=10.0)
 #### `sandbox.spawn(cmd) -> None`
 
 Spawn `cmd` without waiting. Use `pid`, `pause()`, `resume()`, `kill()`,
-and `wait()` to manage the process lifecycle.
+`wait()` and `shutdown()` to manage the session.
 
 Raises `RuntimeError` if a process is already running.
 
@@ -353,9 +353,21 @@ Release a previously `create()`d child to `execve`.
 
 Raises `RuntimeError` if no child has been created.
 
-#### `sandbox.wait() -> Result`
+#### `sandbox.wait(timeout=None) -> ExitStatus`
 
-Wait for the running process to finish and return its `Result`.
+Wait for the main process and return its `ExitStatus`. Background jobs it
+started keep running under supervision. A `timeout` raises `TimeoutError`
+and leaves the session running.
+
+#### `sandbox.shutdown() -> Result`
+
+Kill whatever is left of the session, wait until it has no process, and
+return the `Result` with captured output and filesystem changes.
+
+`kill()`, `pause()`, `resume()` and `process_groups()` work from any
+thread, including while another thread is blocked in `wait()`. A
+`popen()` `Process` has the same `wait()`, `shutdown()` and
+`process_groups()`.
 
 #### Inspecting and deferring COW changes
 
@@ -406,7 +418,7 @@ The sandbox name.
 
 #### `sandbox.pid -> int | None`
 
-The child PID while running, `None` otherwise.
+Main's PID until it exits, `None` otherwise.
 
 #### `sandbox.is_running -> bool`
 
@@ -419,7 +431,7 @@ Only contains entries where port remapping occurred. Requires `port_remap=True`.
 
 #### `sandbox.pause()` / `sandbox.resume()` / `sandbox.kill()`
 
-Send SIGSTOP / SIGCONT / SIGKILL to the sandbox process group.
+Send SIGSTOP / SIGCONT / SIGKILL to every process group of the session.
 Raises `RuntimeError` if the sandbox is not running.
 
 #### `sandbox.checkpoint(save_fn=None) -> Checkpoint`

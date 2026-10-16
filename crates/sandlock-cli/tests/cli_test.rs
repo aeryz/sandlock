@@ -672,6 +672,29 @@ fn test_kill_stops_sandbox() {
 }
 
 #[test]
+fn test_kill_stops_sandbox_without_supervisor() {
+    let name = format!("test-kill-nosup-{}", std::process::id());
+    let mut args = sandlock_sleep_args(&name);
+    args.insert(1, "--no-supervisor".into());
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sandlock"))
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sandlock");
+    if let Err(e) = wait_for_sandbox(&mut child, &name) {
+        panic!("{}", e);
+    }
+    let out = sandlock_bin().args(["kill", &name]).output().expect("sandlock kill");
+    assert!(
+        out.status.success(),
+        "kill should succeed without a supervisor: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!child.wait().expect("wait for killed child").success());
+}
+
+#[test]
 fn test_kill_nonexistent_sandbox() {
     let out = sandlock_bin()
         .args(["kill", "nonexistent-sandbox-xyz-99999"])

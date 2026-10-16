@@ -152,6 +152,21 @@ async fn test_checkpoint_process_info() {
     let _ = sb.wait().await;
 }
 
+#[tokio::test]
+async fn test_checkpoint_refused_after_main_exits() {
+    let mut sb = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc")
+        .build().unwrap();
+    sb.spawn(&["sh", "-c", "sleep 60 & exit 0"]).await.unwrap();
+    sb.wait().await.unwrap();
+    assert!(matches!(
+        sb.checkpoint().await,
+        Err(sandlock_core::SandlockError::Runtime(sandlock_core::error::SandboxRuntimeError::NotRunning))
+    ));
+    sb.shutdown().await.unwrap();
+}
+
 /// Test loading from a nonexistent directory fails.
 #[tokio::test]
 async fn test_checkpoint_load_nonexistent() {

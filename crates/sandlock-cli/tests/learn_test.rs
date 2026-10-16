@@ -1151,3 +1151,27 @@ fn test_learn_merge_preserves_home_variable() {
     assert!(!reads.iter().any(|r| r.starts_with(&format!("{home}/.config"))),
         "merge added a machine-specific duplicate of ${{HOME}}/.config: {reads:?}");
 }
+
+/// A timeout ends the whole session, background jobs included, and still
+/// writes what was observed before it.
+#[test]
+fn test_learn_timeout_ends_the_session() {
+    // A sleep length no other process uses, so the job can be found afterwards.
+    let marker = format!("{}.{}", 3000 + std::process::id() % 1000, std::process::id());
+    let cmd = format!("cat /etc/hostname; sleep {marker} & sleep 60");
+    let started = std::time::Instant::now();
+    let output = sandlock_bin()
+        .args(["learn", "--timeout", "1", "--", "sh", "-c", &cmd])
+        .output()
+        .expect("failed to run sandlock learn");
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "learn ignored its timeout");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let read_line = stdout.lines().find(|l| l.starts_with("read = [")).unwrap_or("");
+    assert!(
+        read_line.contains("/etc/hostname"),
+        "expected a partial profile with /etc/hostname, got: {stdout}; stderr={}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let survivors = Command::new("pgrep").args(["-f", &format!("sleep {marker}")]).output().unwrap();
+    assert!(survivors.stdout.is_empty(), "the background job outlived the timeout");
+}

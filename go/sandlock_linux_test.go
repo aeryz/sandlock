@@ -393,15 +393,18 @@ func TestDeferHoldsTheBranchForTheProcess(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 	defer p.Close()
-	res, err := p.Wait()
-	if err != nil {
+	if _, err := p.Wait(); err != nil {
 		t.Fatalf("Wait: %v", err)
+	}
+	res, err := p.Shutdown()
+	if err != nil {
+		t.Fatalf("Shutdown: %v", err)
 	}
 	if !res.Success || len(res.Changes) != 1 {
 		t.Fatalf("unexpected result: %+v", res)
 	}
 	if !p.Pending() {
-		t.Fatal("a Defer run must be pending after Wait")
+		t.Fatal("a Defer run must be pending after Shutdown")
 	}
 	if _, statErr := os.Stat(dir + "/out.txt"); statErr == nil {
 		t.Fatal("nothing may land before Commit")
@@ -440,6 +443,9 @@ func TestDeferAbortDiscards(t *testing.T) {
 	defer p.Close()
 	if _, err := p.Wait(); err != nil {
 		t.Fatalf("Wait: %v", err)
+	}
+	if _, err := p.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
 	}
 	if err := p.Abort(); err != nil {
 		t.Fatalf("Abort: %v", err)
@@ -556,7 +562,7 @@ func TestPopenWaitClosesUnclosedStdin(t *testing.T) {
 	// stdout concurrently so a full pipe can never be the reason cat blocks.
 	go io.ReadAll(p.Stdout)
 
-	done := make(chan *sandlock.Result, 1)
+	done := make(chan *sandlock.ExitStatus, 1)
 	go func() {
 		res, _ := p.Wait()
 		done <- res

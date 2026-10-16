@@ -169,6 +169,12 @@ pub(crate) fn bind_control_socket(name: &str) -> std::io::Result<ControlSocket> 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct SandboxInfo {
     pub mode: Option<String>,
+    /// Main's pid in the registry is free for reuse once this is set.
+    #[serde(default)]
+    pub main_exited: bool,
+    /// Process groups of the session that still have members.
+    #[serde(default)]
+    pub live_groups: usize,
 }
 
 /// Spawn the control-loop task. `ctx` is `None` for sandboxes without a
@@ -177,6 +183,7 @@ pub struct SandboxInfo {
 pub(crate) fn spawn_control_loop(
     sockets: ControlSocket,
     ctx: Option<Arc<SupervisorCtx>>,
+    controller: crate::Controller,
     sandbox: Sandbox,
     info: SandboxInfo,
 ) -> tokio::task::JoinHandle<()> {
@@ -185,7 +192,7 @@ pub(crate) fn spawn_control_loop(
     let sandbox = Arc::new(tokio::sync::Mutex::new(sandbox));
     tokio::spawn(async move {
         let ControlSocket { control, claim: _claim } = sockets;
-        control_loop(control, ctx, sandbox, info, unsafe { libc::getuid() }).await;
+        control_loop(control, ctx, controller, sandbox, info, unsafe { libc::getuid() }).await;
     })
 }
 
@@ -271,6 +278,7 @@ impl tokio::io::AsyncWrite for ControlStream {
 async fn control_loop(
     listener: ControlFd,
     ctx: Option<Arc<SupervisorCtx>>,
+    controller: crate::Controller,
     sandbox: Arc<tokio::sync::Mutex<Sandbox>>,
     info: SandboxInfo,
     my_uid: u32,
@@ -289,7 +297,7 @@ async fn control_loop(
         let Ok(stream) = AsyncFd::new(stream).map(ControlStream) else { continue };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            serve_one(stream, ctx.as_ref(), &sandbox, &info),
+            serve_one(stream, ctx.as_ref(), &controller, &sandbox, &info),
         )
         .await;
     }
@@ -321,6 +329,7 @@ pub struct ControlResponse {
 async fn serve_one(
     stream: ControlStream,
     ctx: Option<&Arc<SupervisorCtx>>,
+    controller: &crate::Controller,
     sandbox: &Arc<tokio::sync::Mutex<Sandbox>>,
     info: &SandboxInfo,
 ) {
@@ -367,10 +376,10 @@ async fn serve_one(
     }
 
     match req.verb.as_str() {
-        "info" => handle_info(&mut stream, info).await,
+        "info" => handle_info(&mut stream, info, controller).await,
         "config" => handle_config(&mut stream, ctx, sandbox).await,
         "ports" => handle_ports(&mut stream, ctx).await,
-        "kill" => handle_kill(&mut stream, ctx).await,
+        "kill" => handle_kill(&mut stream, controller).await,
         _ => {
             let resp = ControlResponse {
                 v: 1,
@@ -383,8 +392,13 @@ async fn serve_one(
     }
 }
 
-async fn handle_info(stream: &mut ControlStream, info: &SandboxInfo) {
-    let resp = match serde_json::to_value(info) {
+async fn handle_info(stream: &mut ControlStream, info: &SandboxInfo, controller: &crate::Controller) {
+    let info = SandboxInfo {
+        main_exited: controller.main_exited(),
+        live_groups: controller.process_groups().map_or(0, |groups| groups.len()),
+        ..info.clone()
+    };
+    let resp = match serde_json::to_value(&info) {
         Ok(data) => ControlResponse { v: 1, ok: true, data: Some(data), err: None },
         Err(e) => ControlResponse {
             v: 1,
@@ -437,29 +451,10 @@ async fn handle_config(
 
 /// Only the supervisor knows the groups a process has moved into, so
 /// `sandlock kill` asks here before it signals the child's own group.
-async fn handle_kill(stream: &mut ControlStream, ctx: Option<&Arc<SupervisorCtx>>) {
-    if let Some(ctx) = ctx {
-        ctx.policy_fn.lock().await.cancellation.cancel();
-    }
-    let resp = match ctx.map(|ctx| ctx.groups.signal(libc::SIGKILL)) {
-        Some(Ok(groups)) => ControlResponse {
-            v: 1,
-            ok: true,
-            data: Some(serde_json::json!({ "groups": groups })),
-            err: None,
-        },
-        Some(Err(e)) => ControlResponse {
-            v: 1,
-            ok: false,
-            data: None,
-            err: Some(format!("signal process groups: {}", e)),
-        },
-        None => ControlResponse {
-            v: 1,
-            ok: false,
-            data: None,
-            err: Some("no supervisor".into()),
-        },
+async fn handle_kill(stream: &mut ControlStream, controller: &crate::Controller) {
+    let resp = match controller.kill() {
+        Ok(()) => ControlResponse { v: 1, ok: true, data: None, err: None },
+        Err(e) => ControlResponse { v: 1, ok: false, data: None, err: Some(e.to_string()) },
     };
     let _ = write_response(stream, &resp).await;
 }
@@ -616,10 +611,10 @@ fn connect_entry(name: &str, entry: &ownership::Entry, my_uid: u32) -> Result<(U
     Ok((stream, cred))
 }
 
-/// The two PIDs `kill` needs, stamped by the kernel at semaphore publication.
+/// The sandbox's PIDs, stamped by the kernel at semaphore publication.
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxPids {
-    /// The child, which leads its own process group.
+    /// Main, whose pid is free for reuse once it has exited.
     pub child: i32,
     pub supervisor: i32,
 }
@@ -654,18 +649,62 @@ fn send_control_request_as(
     args: serde_json::Value,
     my_uid: u32,
 ) -> Result<ControlResponse, String> {
+    let (stream, _) = connect_control(name, my_uid)?;
+    // A short timeout so a wedged supervisor does not block the CLI forever.
+    exchange(name, stream, verb, args, std::time::Duration::from_secs(2)).map_err(|e| e.message)
+}
+
+/// Kill through the supervisor's group table. Only a supervisor that accepts
+/// the connection and then never answers is killed instead, and the reaper
+/// then kills main's group; a closed connection means it is tearing down.
+pub fn kill_sandbox(name: &str) -> Result<(), String> {
+    let (stream, cred) = connect_control(name, unsafe { libc::getuid() })?;
+    // Opened while connected, so it names the peer SO_PEERCRED vouched for.
+    let supervisor = crate::sys::syscall::pidfd_open(cred.pid as u32, 0)
+        .map_err(|e| format!("pidfd_open supervisor: {e}"))?;
+    let args = serde_json::Value::Object(Default::default());
+    // Longer than the server's per-client cap, so waiting in its queue is not
+    // mistaken for a wedge.
+    match exchange(name, stream, "kill", args, std::time::Duration::from_secs(8)) {
+        Ok(resp) if resp.ok => Ok(()),
+        Ok(resp) => Err(resp.err.unwrap_or_else(|| "kill failed".into())),
+        Err(e) if e.timed_out => crate::sys::syscall::pidfd_send_signal(&supervisor, libc::SIGKILL)
+            .map_err(|e| format!("kill unresponsive supervisor: {e}")),
+        Err(e) => Err(e.message),
+    }
+}
+
+struct ExchangeError {
+    timed_out: bool,
+    message: String,
+}
+
+impl ExchangeError {
+    fn other(message: String) -> Self {
+        Self { timed_out: false, message }
+    }
+
+    fn read(name: &str, e: std::io::Error) -> Self {
+        let timed_out = matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut);
+        Self { timed_out, message: unresponsive(name, e) }
+    }
+}
+
+fn exchange(
+    name: &str,
+    mut stream: UnixStream,
+    verb: &str,
+    args: serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<ControlResponse, ExchangeError> {
     use std::io::{Read, Write};
 
-    let (mut stream, _) = connect_control(name, my_uid)?;
-
-    // Set a 2-second timeout on reads so a wedged supervisor does not
-    // block the CLI forever.
     stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-        .map_err(|e| format!("set_read_timeout: {}", e))?;
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| ExchangeError::other(format!("set_read_timeout: {}", e)))?;
     stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
-        .map_err(|e| format!("set_write_timeout: {}", e))?;
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| ExchangeError::other(format!("set_write_timeout: {}", e)))?;
 
     let req = serde_json::json!({
         "v": 1,
@@ -673,24 +712,24 @@ fn send_control_request_as(
         "args": args,
     });
     let body = serde_json::to_vec(&req)
-        .map_err(|e| format!("serialize request: {}", e))?;
+        .map_err(|e| ExchangeError::other(format!("serialize request: {}", e)))?;
 
     let len = (body.len() as u32).to_be_bytes();
-    stream.write_all(&len).map_err(|e| format!("write len: {}", e))?;
-    stream.write_all(&body).map_err(|e| format!("write body: {}", e))?;
+    stream.write_all(&len).map_err(|e| ExchangeError::other(format!("write len: {}", e)))?;
+    stream.write_all(&body).map_err(|e| ExchangeError::other(format!("write body: {}", e)))?;
 
     // Read response.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| unresponsive(name, e))?;
+    stream.read_exact(&mut len_buf).map_err(|e| ExchangeError::read(name, e))?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
     if resp_len > 65536 {
-        return Err("response too large".to_string());
+        return Err(ExchangeError::other("response too large".to_string()));
     }
     let mut resp_body = vec![0u8; resp_len];
-    stream.read_exact(&mut resp_body).map_err(|e| unresponsive(name, e))?;
+    stream.read_exact(&mut resp_body).map_err(|e| ExchangeError::read(name, e))?;
 
     serde_json::from_slice(&resp_body)
-        .map_err(|e| format!("parse response: {}", e))
+        .map_err(|e| ExchangeError::other(format!("parse response: {}", e)))
 }
 
 /// Ask a sandbox for its mode.
@@ -806,7 +845,7 @@ mod tests {
     }
 
     fn info() -> SandboxInfo {
-        SandboxInfo { mode: Some("test".into()) }
+        SandboxInfo { mode: Some("test".into()), main_exited: false, live_groups: 0 }
     }
 
     /// Bind a listener for `name`, run the control loop on it with
@@ -816,7 +855,13 @@ mod tests {
         let sandbox = Arc::new(tokio::sync::Mutex::new(test_sandbox()));
         tokio::spawn(async move {
             let _claim = sockets.claim;
-            control_loop(sockets.control, None, sandbox, info(), expected_uid).await;
+            let controller = crate::Controller {
+                groups: Arc::new(crate::pgroup::ProcessGroups::new()),
+                stop: Default::default(),
+                main_exit: crate::controller::MainExit::new(None),
+                pid: 0,
+            };
+            control_loop(sockets.control, None, controller, sandbox, info(), expected_uid).await;
         })
     }
 

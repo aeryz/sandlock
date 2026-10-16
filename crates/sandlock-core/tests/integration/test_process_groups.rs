@@ -206,3 +206,165 @@ os.rename("{0}.tmp", "{0}")
     let leader: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
     assert!(wait_gone(leader), "session leader {leader} outlived the main process");
 }
+
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wait_keeps_jobs_and_shutdown_ends_them() {
+    use std::io::BufRead;
+    let mut sb = policy();
+    let mut proc = sb
+        .popen(&["sh", "-c", "sleep 60 & echo $!; exit 3"], sandlock_core::StdioMode::Inherit, sandlock_core::StdioMode::Piped, sandlock_core::StdioMode::Inherit)
+        .await
+        .unwrap();
+    let mut job = String::new();
+    std::io::BufReader::new(std::fs::File::from(proc.take_stdout().unwrap())).read_line(&mut job).unwrap();
+    let job: i32 = job.trim().parse().unwrap();
+    assert_eq!(proc.wait().await.unwrap(), sandlock_core::ExitStatus::Code(3));
+    assert!(alive(job), "the job survives wait()");
+    assert!(!proc.controller().unwrap().process_groups().unwrap().is_empty());
+    assert_eq!(proc.shutdown().await.unwrap().exit_status, sandlock_core::ExitStatus::Code(3));
+    assert!(wait_gone(job), "shutdown() ends the job");
+}
+
+#[tokio::test]
+async fn test_shutdown_returns_output_while_a_job_holds_stdout() {
+    let mut sb = policy();
+    sb.spawn(&["sh", "-c", "sleep 60 & echo main-output"]).await.unwrap();
+    sb.wait().await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), sb.shutdown()).await.unwrap().unwrap();
+    assert_eq!(result.stdout.as_deref(), Some(b"main-output\n".as_slice()));
+}
+
+/// The reaper collects a main that exits right after exec before spawn()
+/// can see its new image; spawn() must still report success.
+#[tokio::test]
+async fn test_spawn_of_an_instantly_exiting_main() {
+    for _ in 0..50 {
+        let mut sb = policy();
+        sb.spawn(&["true"]).await.unwrap();
+        assert_eq!(sb.wait().await.unwrap(), sandlock_core::ExitStatus::Code(0));
+        sb.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_spawn_beside_a_parked_sibling() {
+    let mut parked = policy();
+    parked.create(&["true"]).await.unwrap();
+    let mut sb = policy();
+    tokio::time::timeout(std::time::Duration::from_secs(5), sb.spawn(&["true"])).await.unwrap().unwrap();
+    sb.wait().await.unwrap();
+    sb.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_pid_is_gone_once_main_exits() {
+    let mut sb = policy();
+    sb.spawn(&["sh", "-c", "sleep 60 & exit 0"]).await.unwrap();
+    let controller = sb.controller().unwrap();
+    sb.wait().await.unwrap();
+    assert_eq!(sb.pid(), None);
+    assert_eq!(controller.pid(), None);
+    sb.shutdown().await.unwrap();
+}
+
+/// Main's status must not depend on a task of the runtime that created the
+/// sandbox.
+#[test]
+fn test_wait_on_another_runtime() {
+    let runtime = || tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let mut sb = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
+        .no_supervisor(true)
+        .build()
+        .unwrap();
+    let first = runtime();
+    first.block_on(sb.spawn(&["sh", "-c", "sleep 0.2; exit 3"])).unwrap();
+    drop(first);
+    let second = runtime();
+    let status = second
+        .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(5), sb.wait()).await })
+        .expect("wait() hangs")
+        .unwrap();
+    assert_eq!(status, sandlock_core::ExitStatus::Code(3));
+    second.block_on(sb.shutdown()).unwrap();
+}
+
+#[tokio::test]
+async fn test_spawn_reports_a_failed_exec() {
+    let mut sb = policy();
+    assert!(sb.spawn(&["/nonexistent-sandlock-binary"]).await.is_err());
+}
+
+#[tokio::test]
+async fn test_shutdown_ends_a_paused_session() {
+    let mut sb = policy();
+    sb.spawn(&["sh", "-c", "sleep 60 & exit 0"]).await.unwrap();
+    sb.wait().await.unwrap();
+    sb.controller().unwrap().pause().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), sb.shutdown()).await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_controller_kills_during_a_blocked_wait() {
+    let mut sb = policy();
+    sb.spawn(&["sleep", "60"]).await.unwrap();
+    let controller = sb.controller().unwrap();
+    let killer = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        controller.kill().unwrap();
+    });
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), sb.wait()).await.unwrap().unwrap();
+    assert_ne!(status, sandlock_core::ExitStatus::Code(0));
+    killer.await.unwrap();
+    sb.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_cancelled_wait_then_shutdown() {
+    let mut sb = policy();
+    sb.spawn(&["sh", "-c", "sleep 0.3; echo done"]).await.unwrap();
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(50), sb.wait()).await.is_err());
+    assert_eq!(sb.wait().await.unwrap(), sandlock_core::ExitStatus::Code(0));
+    assert_eq!(sb.shutdown().await.unwrap().stdout.as_deref(), Some(b"done\n".as_slice()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drop_after_wait_ends_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("job");
+    let mut sb = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
+        .fs_read("/proc").fs_read("/dev").fs_write(dir.path())
+        .build()
+        .unwrap();
+    sb.spawn(&["sh", "-c", &format!("sleep 60 & echo $! > {}", pidfile.display())]).await.unwrap();
+    sb.wait().await.unwrap();
+    let job: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+    assert!(alive(job));
+    drop(sb);
+    assert!(wait_gone(job));
+}
+
+/// Dropping the sandbox after wait() must also reach jobs that left main's
+/// group, not only those the reaper can kill by itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_drop_after_wait_ends_jobs_in_other_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("leader");
+    let script = format!(
+        "import os, signal\npid = os.fork()\nif pid == 0:\n    os.setsid()\n    signal.pause()\nopen('{p}.tmp', 'w').write(str(pid))\nos.rename('{p}.tmp', '{p}')\n",
+        p = pid_file.display()
+    );
+    let mut sb = policy();
+    sb.fs_writable.push(dir.path().to_path_buf());
+    sb.spawn(&["python3", "-c", &script]).await.unwrap();
+    sb.wait().await.unwrap();
+    let leader: i32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+    assert!(alive(leader), "the setsid job survives wait()");
+    drop(sb);
+    assert!(wait_gone(leader), "Drop must end jobs in groups the sandbox created");
+}

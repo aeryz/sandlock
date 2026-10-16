@@ -285,23 +285,35 @@ async fn main() -> Result<()> {
             } else {
                 println!("NAME                                  PID        UPTIME  STATUS      PORTS                     CMD");
                 for name in &names {
-                    // The pids need no answer from the supervisor; the rest
-                    // does, and a supervisor that does not answer is still
-                    // alive because its socket is.
-                    let (status, ports) = match sandlock_core::control::sandbox_info(name) {
-                        Ok(info) => (
-                            info.mode.unwrap_or_else(|| "running".to_string()),
-                            query_ports(name),
+                    // The registry's main pid outlives main. A pidfd opened before
+                    // the supervisor vouches main is alive names main, and /proc
+                    // is trusted only if main is still alive after reading it.
+                    let pid = sandlock_core::control::sandbox_pids(name).map(|p| p.child);
+                    let main_fd = pid.as_ref().ok().and_then(|&pid| pidfd_open(pid));
+                    let (status, ports, pid, uptime, cmd) = match (sandlock_core::control::sandbox_info(name), pid) {
+                        (Ok(info), Ok(pid)) if !info.main_exited => {
+                            let uptime = proc_uptime(pid);
+                            let cmd = proc_cmdline(pid);
+                            if main_fd.as_ref().is_some_and(|fd| !pidfd_exited(fd)) {
+                                (
+                                    info.mode.unwrap_or_else(|| "running".to_string()),
+                                    query_ports(name),
+                                    pid.to_string(),
+                                    uptime.unwrap_or_else(|| "?".to_string()),
+                                    cmd.unwrap_or_else(|| "?".to_string()),
+                                )
+                            } else {
+                                main_exited_row(name, info)
+                            }
+                        }
+                        (Ok(info), _) if info.main_exited => main_exited_row(name, info),
+                        (info, pid) => (
+                            if info.is_ok() { "running" } else { "unresponsive" }.to_string(),
+                            "?".to_string(),
+                            pid.map_or_else(|_| "?".to_string(), |p| p.to_string()),
+                            "?".to_string(),
+                            "?".to_string(),
                         ),
-                        Err(_) => ("unresponsive".to_string(), "?".to_string()),
-                    };
-                    let (pid, uptime, cmd) = match sandlock_core::control::sandbox_pids(name) {
-                        Ok(pids) => (
-                            pids.child.to_string(),
-                            proc_uptime(pids.child).unwrap_or_else(|| "?".to_string()),
-                            proc_cmdline(pids.child).unwrap_or_else(|| "?".to_string()),
-                        ),
-                        Err(_) => ("?".to_string(), "?".to_string(), "?".to_string()),
                     };
                     println!(
                         "{:<32} {:>8}  {:>12}  {:<10}  {:<24}  {}",
@@ -358,30 +370,11 @@ async fn main() -> Result<()> {
                 eprintln!("sandlock: {e}");
                 std::process::exit(1);
             }
-            // Both pids come from the kernel, so this works on a supervisor
-            // that is stopped or wedged.
-            let pids = match sandlock_core::control::sandbox_pids(&name) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("sandlock: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            // Groups the sandbox created are known only to the supervisor,
-            // and a wedged one cannot answer, so the child's own group is
-            // signalled here regardless. The supervisor may sit in a
-            // different group, so signal it directly too.
-            let _ = sandlock_core::control::send_control_request(
-                &name,
-                "kill",
-                serde_json::Value::Object(Default::default()),
-            );
-            unsafe { libc::killpg(pids.child, libc::SIGKILL) };
-            unsafe { libc::kill(pids.supervisor, libc::SIGKILL) };
-            println!(
-                "Killed sandbox '{}' (child PID {}, supervisor PID {})",
-                name, pids.child, pids.supervisor
-            );
+            if let Err(e) = sandlock_core::control::kill_sandbox(&name) {
+                eprintln!("sandlock: kill '{}': {}", name, e);
+                std::process::exit(1);
+            }
+            println!("Killed sandbox '{}'", name);
         }
 
         Command::Check => {
@@ -956,6 +949,36 @@ fn validate_cli_name(name: &str) -> Result<(), String> {
 /// Query the control socket for the virtual→real port map, returning a
 /// compact display string or `"-"` when the socket is missing (e.g.
 /// `--no-supervisor`).
+fn main_exited_row(
+    name: &str,
+    info: sandlock_core::control::SandboxInfo,
+) -> (String, String, String, String, String) {
+    let cmd = match info.live_groups {
+        0 => "(main exited, idle)".to_string(),
+        1 => "(main exited, 1 group)".to_string(),
+        n => format!("(main exited, {n} groups)"),
+    };
+    (
+        info.mode.unwrap_or_else(|| "running".to_string()),
+        query_ports(name),
+        "-".to_string(),
+        "-".to_string(),
+        cmd,
+    )
+}
+
+fn pidfd_open(pid: i32) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) })
+}
+
+fn pidfd_exited(fd: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    unsafe { libc::poll(&mut poll, 1, 0) != 0 }
+}
+
 fn query_ports(name: &str) -> String {
     use sandlock_core::control::send_control_request;
     match send_control_request(name, "ports", serde_json::Value::Object(Default::default())) {

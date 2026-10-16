@@ -317,9 +317,17 @@ const (
 	ReasonSignaled ExitReason = 1
 	// ReasonKilled: killed with no recoverable signal number.
 	ReasonKilled ExitReason = 2
-	// ReasonTimeout: killed by sandlock because it exceeded its timeout.
+	// ReasonTimeout: a run exceeded its timeout and was killed.
 	ReasonTimeout ExitReason = 3
 )
+
+// ExitStatus describes the main process; its session may still be running.
+type ExitStatus struct {
+	ExitCode int
+	Reason   ExitReason
+	Signal   int
+	Success  bool
+}
 
 // Result is the outcome of a captured run.
 type Result struct {

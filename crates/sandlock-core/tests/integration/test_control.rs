@@ -419,7 +419,7 @@ fn test_control_no_supervisor() {
 
             let pids = sandlock_core::control::sandbox_pids(&name).expect("pids");
             assert_eq!(pids.supervisor, child.id() as i32, "supervisor pid: {:?}", pids);
-            assert_eq!(unsafe { libc::getpgid(pids.child) }, pids.child, "child leads its group: {:?}", pids);
+            assert_ne!(unsafe { libc::getpgid(pids.child) }, pids.child, "main runs in the reaper's group: {:?}", pids);
             let info = sandlock_core::control::sandbox_info(&name).expect("info");
             assert_eq!(info.mode, None);
 
@@ -748,7 +748,7 @@ async fn test_control_parked_child_does_not_pin_other_names() {
     parked.create(&["true"]).await.unwrap();
 
     first.start().unwrap();
-    first.wait().await.unwrap();
+    async { first.wait().await?; first.shutdown().await }.await.unwrap();
 
     let again = policy
         .clone()
@@ -756,7 +756,7 @@ async fn test_control_parked_child_does_not_pin_other_names() {
         .run(&["true"])
         .await;
     parked.start().unwrap();
-    let _ = parked.wait().await;
+    let _ = async { parked.wait().await?; parked.shutdown().await }.await;
     assert!(again.is_ok(), "a parked sibling must not pin the name: {:?}", again.err());
 }
 
@@ -773,7 +773,7 @@ async fn test_control_child_pid_is_published_before_start() {
         assert_eq!(pids.supervisor, std::process::id() as i32);
     }
     sb.start().unwrap();
-    assert!(sb.wait().await.unwrap().success());
+    assert!(async { sb.wait().await?; sb.shutdown().await }.await.unwrap().success());
 }
 
 // ============================================================
@@ -874,4 +874,79 @@ async fn test_control_cancelled_creation_releases_its_name() {
     drop(creation);
     assert!(!sandlock_core::control::list_sandboxes().unwrap().contains(&name));
     drop(cancelled);
+}
+
+/// A session can outlive its main process, whose pid is then free for
+/// reuse; ps must stop reporting it instead of reading a recycled /proc entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_ps_hides_the_pid_of_an_exited_main() {
+    let name = format!("test-ctrl-main-exited-{}", std::process::id());
+    let mut sb = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .build()
+        .unwrap()
+        .with_name(&name);
+    sb.spawn(&["sh", "-c", "sleep 60 & exit 0"]).await.unwrap();
+    sb.wait().await.unwrap();
+    assert!(sandlock_core::control::sandbox_info(&name).expect("info").main_exited);
+    let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout.lines().find(|l| l.starts_with(&name)).expect("ps lists the session");
+    assert_eq!(row.split_whitespace().nth(1), Some("-"), "exited main has no pid: {row}");
+    assert!(row.ends_with("(main exited, 1 group)"), "{row}");
+    sb.shutdown().await.unwrap();
+}
+
+/// A session whose main exited alone stays listed until shutdown(); ps must
+/// tell it apart from one with jobs still running.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_ps_reports_an_idle_session() {
+    let name = format!("test-ctrl-idle-{}", std::process::id());
+    let mut sb = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .build()
+        .unwrap()
+        .with_name(&name);
+    sb.spawn(&["true"]).await.unwrap();
+    sb.wait().await.unwrap();
+    let out = sandlock_bin().args(["ps"]).output().expect("sandlock ps");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let row = stdout.lines().find(|l| l.starts_with(&name)).expect("ps lists the session");
+    assert!(row.ends_with("(main exited, idle)"), "{row}");
+    sb.shutdown().await.unwrap();
+}
+
+/// A host in shutdown drops its control socket mid-request; kill must not
+/// take the host down for it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_control_kill_does_not_kill_a_host_in_teardown() {
+    let name = format!("test-ctrl-teardown-{}", std::process::id());
+    let mut sb = sandlock_core::Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/bin")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .build()
+        .unwrap()
+        .with_name(&name);
+    sb.spawn(&["sleep", "60"]).await.unwrap();
+    let killer = std::thread::spawn({
+        let name = name.clone();
+        move || {
+            for _ in 0..50 {
+                let _ = sandlock_core::control::kill_sandbox(&name);
+            }
+        }
+    });
+    sb.shutdown().await.unwrap();
+    killer.join().unwrap();
+    // Reaching this line means the host survived every kill attempt.
 }

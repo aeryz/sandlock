@@ -288,7 +288,13 @@ struct Runtime {
     state: RuntimeState,
     child_pid: Option<i32>,
     pidfd: Option<std::os::fd::OwnedFd>,
+    reaper: Option<crate::reaper::Reaper>,
+    main_exit: Arc<crate::controller::MainExit>,
     groups: Arc<crate::pgroup::ProcessGroups>,
+    /// Cancelled by a kill, so a held policy_fn verdict cannot stall it.
+    stop: tokio_util::sync::CancellationToken,
+    /// Ends the drains once released jobs might hold the write ends forever.
+    drain_cut: tokio_util::sync::CancellationToken,
     notif_handle: Option<JoinHandle<()>>,
     policy_fn_worker: Option<crate::policy_fn::PolicyFnWorker>,
     throttle_handle: Option<JoinHandle<()>>,
@@ -322,6 +328,8 @@ struct Runtime {
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
     ready_w: Option<std::os::fd::OwnedFd>,
+    /// The child's exec pipe: EOF after `EXEC_REACHED` alone means it exec'd.
+    exec_r: Option<std::os::fd::OwnedFd>,
     /// Set when this sandbox is a stage of a [`Transaction`](crate::transaction::Transaction)
     /// that shares one COW upper across all stages. When present, `do_create_stdio`
     /// reuses this `CowState` (instead of building its own branch), and neither
@@ -356,6 +364,7 @@ enum RuntimeState {
     Created,
     Running,
     Paused,
+    MainExited(crate::result::ExitStatus),
     Stopped(crate::result::ExitStatus),
 }
 
@@ -855,15 +864,17 @@ impl Sandbox {
             .or_else(|| self.name.as_deref())
     }
 
-    /// Return the child PID if spawned.
+    /// Main's pid until it exits; afterwards the number may name another process.
     pub fn pid(&self) -> Option<i32> {
-        self.runtime.as_ref().and_then(|r| r.child_pid)
+        self.runtime.as_ref()
+            .filter(|rt| rt.main_exit.get().is_none())
+            .and_then(|rt| rt.child_pid)
     }
 
     /// Return whether the child is currently running or paused.
     pub fn is_running(&self) -> bool {
         self.runtime.as_ref().map(|r| {
-            matches!(r.state, RuntimeState::Running | RuntimeState::Paused)
+            matches!(r.state, RuntimeState::Running | RuntimeState::Paused | RuntimeState::MainExited(_))
         }).unwrap_or(false)
     }
 
@@ -871,41 +882,44 @@ impl Sandbox {
     /// members left. Groups stay reachable after the main process has been
     /// reaped, so this can sweep what a `wait()` left behind.
     pub fn signal(&self, sig: i32) -> Result<usize, crate::error::SandlockError> {
-        use crate::error::SandboxRuntimeError;
-        let rt = self.runtime.as_ref()
-            .filter(|rt| rt.child_pid.is_some())
-            .ok_or(SandboxRuntimeError::NotRunning)?;
-        if sig == libc::SIGKILL {
-            if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
-        }
-        Ok(rt.groups.signal(sig).map_err(SandboxRuntimeError::Io)?)
+        self.controller()?.signal(sig)
     }
 
-    fn signal_live_groups(&self, sig: i32) -> Result<(), crate::error::SandlockError> {
-        if self.signal(sig)? == 0 {
-            let gone = std::io::Error::from_raw_os_error(libc::ESRCH);
-            return Err(crate::error::SandboxRuntimeError::Io(gone).into());
-        }
-        Ok(())
+    /// A handle that acts on this session from another task or thread,
+    /// including while `wait()` holds the `Sandbox`.
+    pub fn controller(&self) -> Result<crate::Controller, crate::error::SandlockError> {
+        let rt = self.runtime.as_ref()
+            .filter(|rt| rt.child_pid.is_some())
+            .ok_or(crate::error::SandboxRuntimeError::NotRunning)?;
+        Ok(crate::Controller {
+            groups: Arc::clone(&rt.groups),
+            stop: rt.stop.clone(),
+            main_exit: Arc::clone(&rt.main_exit),
+            pid: rt.child_pid.unwrap_or(0),
+        })
     }
 
     /// Send SIGSTOP to the sandbox's process groups.
     pub fn pause(&mut self) -> Result<(), crate::error::SandlockError> {
-        self.signal_live_groups(libc::SIGSTOP)?;
-        self.rt_mut().state = RuntimeState::Paused;
+        self.controller()?.pause()?;
+        if !matches!(self.rt().state, RuntimeState::MainExited(_)) {
+            self.rt_mut().state = RuntimeState::Paused;
+        }
         Ok(())
     }
 
     /// Send SIGCONT to the sandbox's process groups.
     pub fn resume(&mut self) -> Result<(), crate::error::SandlockError> {
-        self.signal_live_groups(libc::SIGCONT)?;
-        self.rt_mut().state = RuntimeState::Running;
+        self.controller()?.resume()?;
+        if !matches!(self.rt().state, RuntimeState::MainExited(_)) {
+            self.rt_mut().state = RuntimeState::Running;
+        }
         Ok(())
     }
 
     /// Send SIGKILL to the sandbox's process groups.
     pub fn kill(&mut self) -> Result<(), crate::error::SandlockError> {
-        self.signal(libc::SIGKILL).map(|_| ())
+        self.controller()?.kill()
     }
 
     /// Set a callback invoked whenever a port bind is recorded.
@@ -938,35 +952,18 @@ impl Sandbox {
         }
     }
 
-    /// Wait for the child process to exit.
+    /// Wait for the main process to exit; background jobs stay supervised
+    /// until [`Self::shutdown`]. Returns the same status on repeated calls.
     ///
-    /// Dropping the returned future does not cost the captured output: the pipe
-    /// drains belong to the `Sandbox`, so a caller that cancels this `wait()`
-    /// (a `timeout` or `select!` around it) and calls `wait()` again still gets
-    /// what the child wrote. That holds wherever the cancellation lands —
-    /// before the drains start, while the child is still running, or while the
-    /// final join is blocked because a descendant is still holding the write
-    /// end open past the child's own exit.
-    pub async fn wait(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+    /// Dropping the returned future costs nothing: the pipe drains belong to
+    /// the `Sandbox`, so a cancelled `wait()` can be followed by another
+    /// `wait()` or by `shutdown()`, which still collects the output.
+    pub async fn wait(&mut self) -> Result<crate::result::ExitStatus, crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        use crate::result::RunResult;
 
         let pid = self.rt().child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
-
-        // Already reaped: hand back the same status again, plus whatever the
-        // drains collected. They outlive the `wait()` that started them, so a
-        // second call still reports the output of a first one that was
-        // cancelled — including one cancelled while joining them here, since a
-        // join only unparks a drain once it has completed. A `wait()` that ran
-        // to the end took them with it, and both streams are then `None`.
-        let stopped = match self.rt().state {
-            RuntimeState::Stopped(ref es) => Some(es.clone()),
-            _ => None,
-        };
-        if let Some(exit_status) = stopped {
-            let changes = self.settle_branch().await;
-            let (stdout, stderr) = self.collect_pipe_drains().await;
-            return Ok(RunResult { exit_status, stdout, stderr, changes });
+        if let RuntimeState::MainExited(ref s) | RuntimeState::Stopped(ref s) = self.rt().state {
+            return Ok(s.clone());
         }
 
         // Deliver EOF to a piped stdin the caller never took: otherwise a child
@@ -993,12 +990,12 @@ impl Sandbox {
         // `Process::take_stdout`/`take_stderr` is `None` here and stays theirs.
         if self.rt().stdout_drain.is_none() {
             if let Some(fd) = self.rt_mut()._stdout_read.take() {
-                self.rt_mut().stdout_drain = sandbox_spawn_pipe_drain(fd);
+                self.rt_mut().stdout_drain = sandbox_spawn_pipe_drain(fd, self.rt().drain_cut.clone());
             }
         }
         if self.rt().stderr_drain.is_none() {
             if let Some(fd) = self.rt_mut()._stderr_read.take() {
-                self.rt_mut().stderr_drain = sandbox_spawn_pipe_drain(fd);
+                self.rt_mut().stderr_drain = sandbox_spawn_pipe_drain(fd, self.rt().drain_cut.clone());
             }
         }
 
@@ -1010,37 +1007,67 @@ impl Sandbox {
         // race the worker for fork events and hang it). Mirrors
         // `spawn_pid_watcher`. Falls back to a blocking `waitpid` only when no
         // pidfd is available (kernel without `pidfd_open`).
-        let exit_status = match self.rt_mut().pidfd.take() {
-            Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
-            None => wait_child_exit_blocking(pid).await,
+        let exit_status = if self.rt().reaper.is_some() {
+            let main_exit = Arc::clone(&self.rt().main_exit);
+            main_exit.wait().await.map_err(SandboxRuntimeError::Io)?
+        } else {
+            match self.rt_mut().pidfd.take() {
+                Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
+                None => wait_child_exit_blocking(pid).await,
+            }
         };
-        // The sandbox ends with its main process: descendants left behind
-        // would run on with every supervised syscall failing, holding the
-        // caller's stdio.
-        let _ = self.rt().groups.signal(libc::SIGKILL);
-
-        self.rt_mut().state = RuntimeState::Stopped(exit_status.clone());
+        self.rt_mut().state = RuntimeState::MainExited(exit_status.clone());
+        self.rt().main_exit.set(exit_status.clone());
 
         if self.rt().tty_foreground_taken {
-            sandbox_restore_tty_foreground(pid);
-            self.rt_mut().tty_foreground_taken = false;
+            sandbox_restore_tty_foreground(&self.rt().groups);
+        }
+        Ok(exit_status)
+    }
+
+    /// Kill every remaining job, wait until the session has no process left,
+    /// then settle COW and collect the captured output. Safe to call again.
+    pub async fn shutdown(&mut self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+        use crate::error::SandboxRuntimeError;
+        use crate::result::RunResult;
+
+        self.rt().child_pid.ok_or(SandboxRuntimeError::NotRunning)?;
+        if !matches!(self.rt().state, RuntimeState::Stopped(_)) {
+            let swept = self.controller()?.kill();
+            let exit_status = self.wait().await?;
+            let no_supervisor = self.no_supervisor;
+            if let Some(mut reaper) = self.rt_mut().reaper.take() {
+                // Untracked jobs (no supervisor, or a group out of reach)
+                // would keep it alive; release them instead.
+                if no_supervisor || swept.is_err() { reaper.finish(); }
+                reaper.join().await;
+                self.rt().drain_cut.cancel();
+            }
+            // A job that outlived main may have taken the terminal back.
+            if self.rt().tty_foreground_taken {
+                sandbox_restore_tty_foreground(&self.rt().groups);
+                self.rt_mut().tty_foreground_taken = false;
+            }
+            self.rt_mut().state = RuntimeState::Stopped(exit_status);
+
+            let rt = self.rt_mut();
+            rt.control_claim = None;
+            if let Some(h) = rt.notif_handle.take() { h.abort(); }
+            rt.policy_fn_worker = None;
+            if let Some(h) = rt.throttle_handle.take() { h.abort(); }
+            if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
+            // Finish shutting down the old endpoint before releasing the name.
+            if let Some(h) = rt.control_handle.take() {
+                h.abort();
+                let _ = h.await;
+            }
+            swept?;
         }
 
-        let rt = self.rt_mut();
-        rt.control_claim = None;
-        if let Some(h) = rt.notif_handle.take() { h.abort(); }
-        rt.policy_fn_worker = None;
-        if let Some(h) = rt.throttle_handle.take() { h.abort(); }
-        if let Some(h) = rt.loadavg_handle.take() { h.abort(); }
-        // Finish shutting down the old endpoint before wait() returns.
-        if let Some(h) = rt.control_handle.take() {
-            h.abort();
-            let _ = h.await;
-        }
-
+        let RuntimeState::Stopped(ref exit_status) = self.rt().state else { unreachable!() };
+        let exit_status = exit_status.clone();
         let changes = self.settle_branch().await;
         let (stdout, stderr) = self.collect_pipe_drains().await;
-
         Ok(RunResult { exit_status, stdout, stderr, changes })
     }
 
@@ -1083,7 +1110,7 @@ impl Sandbox {
     /// exited non-zero.
     fn branch_action(&self) -> BranchAction {
         let failed = self.runtime.as_ref().is_some_and(|rt| {
-            matches!(rt.state, RuntimeState::Stopped(ref s) if !matches!(s, crate::result::ExitStatus::Code(0)))
+            matches!(rt.state, RuntimeState::MainExited(ref s) | RuntimeState::Stopped(ref s) if !matches!(s, crate::result::ExitStatus::Code(0)))
         });
         if failed { self.on_error.clone() } else { self.on_exit.clone() }
     }
@@ -1343,43 +1370,34 @@ impl Sandbox {
         &self.restore_skipped
     }
 
-    /// Wait for the child to finish `execve`. Detected by `/proc/<pid>/exe`
-    /// no longer matching `/proc/self/exe` (before execve the child still
-    /// shares the supervisor's binary). The kernel offers no direct event
-    /// for execve completion, so this polls every 1ms. Policy approvals add
-    /// their configured timeout to the usual five-second startup allowance;
-    /// unlimited approvals also disable the startup deadline.
-    async fn wait_until_exec(&self) -> Result<(), crate::error::SandlockError> {
+    /// Wait for the child to finish `execve`, which closes its exec pipe.
+    /// Policy approvals add their configured timeout to the usual five-second
+    /// startup allowance; unlimited approvals also disable the startup deadline.
+    async fn wait_until_exec(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
-        let Some(our_exe) = std::fs::read_link("/proc/self/exe").ok() else {
-            return Ok(());
-        };
-        let child_link = format!("/proc/{}/exe", pid);
+        use tokio::io::AsyncReadExt;
+        let exec_r = self.rt_mut().exec_r.take().ok_or(SandboxRuntimeError::NotRunning)?;
+        let mut exec_r = tokio::net::unix::pipe::Receiver::from_owned_fd(exec_r)
+            .map_err(SandboxRuntimeError::Io)?;
         let startup_allowance = Duration::from_secs(5);
         let timeout = if let Some(policy_fn) = &self.policy_fn {
             policy_fn.verdict_timeout.map(|timeout| timeout.saturating_add(startup_allowance))
         } else {
             Some(startup_allowance)
         };
-        let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
-        loop {
-            match std::fs::read_link(&child_link) {
-                Ok(child_exe) if child_exe != our_exe => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(SandboxRuntimeError::Child(
-                        "child exited before exec() completed".into(),
-                    ).into());
-                }
-                _ => {}
-            }
-            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Err(SandboxRuntimeError::Child(
-                    "child did not exec() within the startup timeout".into(),
-                ).into());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let mut marks = Vec::new();
+        let read = exec_r.read_to_end(&mut marks);
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, read).await.map_err(|_| {
+                SandboxRuntimeError::Child("child did not exec() within the startup timeout".into())
+            })?,
+            None => read.await,
         }
+        .map_err(SandboxRuntimeError::Io)?;
+        if marks != [context::EXEC_REACHED] {
+            return Err(SandboxRuntimeError::Child("child exited before exec() completed".into()).into());
+        }
+        Ok(())
     }
 
     /// Create with explicit stdin/stdout/stderr fd redirection. Child is
@@ -1466,9 +1484,7 @@ impl Sandbox {
     #[cfg(feature = "checkpoint")]
     pub async fn checkpoint(&self) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
-        let pid = self.runtime.as_ref()
-            .and_then(|rt| rt.child_pid)
-            .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
+        let pid = self.pid().ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         self.checkpoint_pid(pid).await
     }
 
@@ -1515,7 +1531,8 @@ impl Sandbox {
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         self.do_create(cmd, true).await?;
         self.do_start()?;
-        self.wait().await
+        self.wait().await?;
+        self.shutdown().await
     }
 
     /// Run with inherited stdio (interactive mode).
@@ -1525,7 +1542,8 @@ impl Sandbox {
     ) -> Result<crate::result::RunResult, crate::error::SandlockError> {
         self.do_create(cmd, false).await?;
         self.do_start()?;
-        self.wait().await
+        self.wait().await?;
+        self.shutdown().await
     }
 
     /// One-shot run with user-supplied syscall handlers.
@@ -1544,7 +1562,8 @@ impl Sandbox {
         self.rt_mut().handlers = pending;
         self.do_create(cmd, true).await?;
         self.do_start()?;
-        self.wait().await
+        self.wait().await?;
+        self.shutdown().await
     }
 
     /// Interactive-stdio counterpart of `run_with_handlers`.
@@ -1563,7 +1582,8 @@ impl Sandbox {
         self.rt_mut().handlers = pending;
         self.do_create(cmd, false).await?;
         self.do_start()?;
-        self.wait().await
+        self.wait().await?;
+        self.shutdown().await
     }
 
     /// Create N COW clones of this sandbox.
@@ -1688,6 +1708,10 @@ impl Sandbox {
                 }),
                 child_pid: Some(clone_pid),
                 pidfd: None,
+                reaper: None,
+                main_exit: crate::controller::MainExit::new(None),
+                stop: tokio_util::sync::CancellationToken::new(),
+                drain_cut: tokio_util::sync::CancellationToken::new(),
                 groups: Arc::new(crate::pgroup::ProcessGroups::new()),
                 notif_handle: None,
                 policy_fn_worker: None,
@@ -1712,6 +1736,7 @@ impl Sandbox {
                 on_bind: None,
                 handlers: Vec::new(),
                 ready_w: None,
+                exec_r: None,
                 #[cfg(feature = "cow")]
                 shared_cow: None,
                 tty_foreground_taken: false,
@@ -1766,7 +1791,8 @@ impl Sandbox {
         unsafe { libc::close(stdin_fds[0]) };
 
         let _ = write_handle.await;
-        reducer.wait().await
+        reducer.wait().await?;
+        reducer.shutdown().await
     }
 
     /// Whether named (pathname) `AF_UNIX` connects should be gated by the
@@ -1793,6 +1819,10 @@ impl Sandbox {
             state: RuntimeState::Created,
             child_pid: None,
             pidfd: None,
+            reaper: None,
+            main_exit: crate::controller::MainExit::new(None),
+            stop: tokio_util::sync::CancellationToken::new(),
+            drain_cut: tokio_util::sync::CancellationToken::new(),
             groups: Arc::new(crate::pgroup::ProcessGroups::new()),
             notif_handle: None,
             policy_fn_worker: None,
@@ -1819,6 +1849,7 @@ impl Sandbox {
             on_bind: None,
             handlers: Vec::new(),
             ready_w: None,
+            exec_r: None,
             #[cfg(feature = "cow")]
             shared_cow: None,
             tty_foreground_taken: false,
@@ -2050,10 +2081,6 @@ impl Sandbox {
             None
         };
 
-        // Capture our PID before fork so the child can detect parent death
-        // without assuming PID 1 is always init (wrong in containers).
-        let parent_pid = unsafe { libc::getpid() };
-
         // Interactive (fully inherited) stdio on a terminal: the child will
         // take the tty foreground group, and this process must take it back
         // once the child is reaped.
@@ -2085,20 +2112,11 @@ impl Sandbox {
         };
         let child_publisher = control_socket.as_ref().and_then(|s| s.claim.as_ref()).map(|c| c.child_publisher());
 
-        let pid = crate::control::fork_without_control_fds();
-        if pid < 0 {
-            return Err(SandboxRuntimeError::Fork(std::io::Error::last_os_error()).into());
-        }
+        let (pid, reaper) = crate::reaper::fork().map_err(SandboxRuntimeError::Fork)?;
 
         if pid == 0 {
             // ===== CHILD PROCESS =====
-            // Publish only after the process group exists, before confinement denies IPC.
-            if unsafe { libc::setpgid(0, 0) } != 0 {
-                use std::io::Write;
-                let err = std::io::Error::last_os_error();
-                let _ = writeln!(std::io::stderr(), "sandlock child: setpgid: {err}");
-                unsafe { libc::_exit(127) };
-            }
+            // Publish before confinement denies IPC.
             if let Some(publisher) = child_publisher {
                 if !publisher.publish() { unsafe { libc::_exit(127); } }
             }
@@ -2172,7 +2190,6 @@ impl Sandbox {
                 keep_fds: &gather_keep_fds,
                 sandbox_name: Some(sandbox_name.as_str()),
                 extra_syscalls: &extra_syscalls,
-                parent_pid,
                 foreground,
             });
         }
@@ -2190,35 +2207,40 @@ impl Sandbox {
         // State remains `Created` until `do_start` writes ready_w to release
         // the child to execve.
 
-        let pidfd = match syscall::pidfd_open(pid as u32, 0) {
-            Ok(fd) => Some(fd),
-            Err(_) => None,
-        };
-        // The child's first act is setpgid(0, 0), so its pid names its group.
-        if let Some(leader) = pidfd.as_ref().and_then(|pfd| pfd.try_clone().ok()) {
-            self.rt_mut().groups.track(pid, leader);
-        }
+        let mut reaper = reaper.expect("parent has a reaper");
+        let status = reaper.take_status().expect("fresh reaper");
+        let key = reaper.pidfd.try_clone().map_err(SandboxRuntimeError::Io)?;
+        self.rt_mut().groups.track(reaper.pid, key);
+        self.rt_mut().main_exit = crate::controller::MainExit::new(Some(status));
+        self.rt_mut().reaper = Some(reaper);
+        let pidfd = syscall::pidfd_open(pid as u32, 0).ok();
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
+        let exec_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
+            .map_err(|e| SandboxRuntimeError::Child(format!("read exec pipe fd from child: {}", e)))?;
+        let take_child_fd = |num: u32, flags: i32| -> Result<OwnedFd, SandboxRuntimeError> {
+            if let Some(ref pfd) = pidfd {
+                return syscall::pidfd_getfd(pfd, num as i32, 0)
+                    .map_err(|e| SandboxRuntimeError::Child(format!("pidfd_getfd: {}", e)));
+            }
+            let cpath = CString::new(format!("/proc/{}/fd/{}", pid, num)).unwrap();
+            let raw = unsafe { libc::open(cpath.as_ptr(), flags | libc::O_CLOEXEC) };
+            if raw < 0 {
+                return Err(SandboxRuntimeError::Child(format!("failed to open child fd {} from /proc", num)));
+            }
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
+        let exec_r = take_child_fd(exec_fd_num, libc::O_RDONLY)?;
 
-        let control_info = crate::control::SandboxInfo { mode: self.mode.clone() };
+        let control_info = crate::control::SandboxInfo { mode: self.mode.clone(), main_exited: false, live_groups: 0 };
 
         let is_nested_mode = notif_fd_num == 0;
 
         let notif_fd = if is_nested_mode {
             None
-        } else if let Some(ref pfd) = pidfd {
-            Some(syscall::pidfd_getfd(pfd, notif_fd_num as i32, 0)
-                .map_err(|e| SandboxRuntimeError::Child(format!("pidfd_getfd: {}", e)))?)
         } else {
-            let path = format!("/proc/{}/fd/{}", pid, notif_fd_num);
-            let cpath = CString::new(path).unwrap();
-            let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-            if raw < 0 {
-                return Err(SandboxRuntimeError::Child("failed to open notif fd from /proc".into()).into());
-            }
-            Some(unsafe { OwnedFd::from_raw_fd(raw) })
+            Some(take_child_fd(notif_fd_num, libc::O_RDWR)?)
         };
 
         if let Some(notif_fd) = notif_fd {
@@ -2373,6 +2395,8 @@ impl Sandbox {
                 policy_fn_state.verdict_timeout = policy_fn.verdict_timeout;
                 policy_fn_state.cancellation = worker.cancellation();
                 policy_fn_state.event_tx = Some(worker.sender());
+                let (stop, worker_cancel) = (self.rt().stop.clone(), worker.cancellation());
+                tokio::spawn(async move { stop.cancelled().await; worker_cancel.cancel() });
                 self.rt_mut().policy_fn_worker = Some(worker);
             }
 
@@ -2454,6 +2478,7 @@ impl Sandbox {
                 self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                     sockets,
                     Some(control_ctx),
+                    self.controller()?,
                     sandbox_snapshot,
                     control_info.clone(),
                 ));
@@ -2479,6 +2504,7 @@ impl Sandbox {
             self.rt_mut().control_handle = Some(crate::control::spawn_control_loop(
                 sockets,
                 None,
+                self.controller()?,
                 self.clone(),
                 control_info,
             ));
@@ -2493,6 +2519,7 @@ impl Sandbox {
 
         self.rt_mut().pidfd = pidfd;
         self.rt_mut().ready_w = Some(pipes.ready_w);
+        self.rt_mut().exec_r = Some(exec_r);
 
         Ok(())
     }
@@ -2531,12 +2558,12 @@ impl Sandbox {
 /// stream opened with [`StdioMode::Piped`] (each available once); the caller
 /// reads/writes those while the process runs. Unlike `std::process::Child`,
 /// this *borrows* the originating [`Sandbox`] rather than owning the process:
-/// the process is killed and reaped when that `Sandbox` is dropped, or eagerly
-/// via [`Process::kill`].
+/// the session is killed and reaped when that `Sandbox` is dropped, or eagerly
+/// via [`Process::shutdown`].
 ///
-/// A `Process` that is dropped without [`Process::wait`] leaves the child
-/// running until the `Sandbox` is dropped — call `wait` (or `kill`) to end it.
-#[must_use = "a Process is a live confined child; call wait() (or kill()) or it runs until the Sandbox is dropped"]
+/// A `Process` dropped without [`Process::shutdown`] leaves the session
+/// running until the `Sandbox` is dropped.
+#[must_use = "a Process is a live confined session; call shutdown() or it runs until the Sandbox is dropped"]
 pub struct Process<'a> {
     sandbox: &'a mut Sandbox,
 }
@@ -2566,8 +2593,7 @@ impl Process<'_> {
         self.sandbox.rt_mut()._stderr_read.take()
     }
 
-    /// The child PID, or `None` if not spawned. Remains `Some` after the child
-    /// exits (until the `Sandbox` is dropped).
+    /// Main's pid until it exits.
     pub fn pid(&self) -> Option<i32> {
         self.sandbox.pid()
     }
@@ -2579,25 +2605,33 @@ impl Process<'_> {
         self.sandbox.kill()
     }
 
-    /// Wait for the child to exit. Any `Piped` stdout/stderr the caller did not
-    /// take is drained into the returned `RunResult`; taken streams are `None`
-    /// because the caller owns them. An untaken piped stdin is closed here so the
-    /// child sees EOF; a *taken* stdin the caller must close itself first (see
-    /// [`Process::take_stdin`]) or this blocks forever.
-    pub async fn wait(self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+    /// Wait for the main process; background jobs stay supervised. An untaken
+    /// piped stdin is closed here so the child sees EOF; a *taken* stdin the
+    /// caller must close itself first (see [`Process::take_stdin`]).
+    pub async fn wait(&mut self) -> Result<crate::result::ExitStatus, crate::error::SandlockError> {
         self.sandbox.wait().await
+    }
+
+    /// End the session. Any `Piped` stdout/stderr the caller did not take is
+    /// drained into the returned `RunResult`; taken streams are `None`.
+    pub async fn shutdown(self) -> Result<crate::result::RunResult, crate::error::SandlockError> {
+        self.sandbox.shutdown().await
+    }
+
+    pub fn controller(&self) -> Result<crate::Controller, crate::error::SandlockError> {
+        self.sandbox.controller()
     }
 }
 
 /// Hand the terminal's foreground process group back to this process after
-/// reaping an interactive child that took it. Restores only while the child's
-/// group still owns the terminal, so a foreground the caller has since given
-/// to someone else is left alone. SIGTTOU is blocked around `tcsetpgrp`:
+/// reaping an interactive child that took it. Restores only while one of the
+/// sandbox's groups holds the terminal, so a foreground the caller has since
+/// given to someone else is left alone. SIGTTOU is blocked around `tcsetpgrp`:
 /// this process is a background group at that moment, and an unblocked
 /// SIGTTOU would stop it, which is the exact symptom being prevented.
-fn sandbox_restore_tty_foreground(child_pid: i32) {
+fn sandbox_restore_tty_foreground(groups: &crate::pgroup::ProcessGroups) {
     unsafe {
-        if libc::isatty(0) != 1 || libc::tcgetpgrp(0) != child_pid {
+        if libc::isatty(0) != 1 || !groups.tracks(libc::tcgetpgrp(0)) {
             return;
         }
         let mut block: libc::sigset_t = std::mem::zeroed();
@@ -2616,19 +2650,23 @@ fn sandbox_restore_tty_foreground(child_pid: i32) {
 
 impl Drop for Sandbox {
     fn drop(&mut self) {
+        let no_supervisor = self.no_supervisor;
         if let Some(ref mut rt) = self.runtime {
             if let Some(worker) = &rt.policy_fn_worker { worker.cancel(); }
             if let Some(pid) = rt.child_pid {
-                if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused) {
-                    let _ = rt.groups.signal(libc::SIGKILL);
-                    // The waitpid below must not hang on a child whose group
-                    // was never recorded. Unreaped, its pid is still ours.
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
-                    let mut status: i32 = 0;
-                    unsafe { libc::waitpid(pid, &mut status, 0) };
+                if matches!(rt.state, RuntimeState::Created | RuntimeState::Running | RuntimeState::Paused | RuntimeState::MainExited(_)) {
+                    let swept = rt.groups.signal(libc::SIGKILL);
+                    if let Some(mut reaper) = rt.reaper.take() {
+                        if no_supervisor || swept.is_err() { reaper.finish(); }
+                        reaper.join_blocking();
+                    } else {
+                        // Unreaped, a clone's pid is still ours.
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                        unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
+                    }
                 }
                 if rt.tty_foreground_taken {
-                    sandbox_restore_tty_foreground(pid);
+                    sandbox_restore_tty_foreground(&rt.groups);
                     rt.tty_foreground_taken = false;
                 }
             }
@@ -2863,7 +2901,10 @@ enum ParkedDrain {
 /// dropping output. The conversion can only fail if the fd is not a readable
 /// pipe, which cannot happen for the pipes `do_create_stdio` creates; if it
 /// somehow did, the stream is left uncaptured rather than the run failing.
-fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<ParkedDrain> {
+fn sandbox_spawn_pipe_drain(
+    fd: std::os::fd::OwnedFd,
+    cut: tokio_util::sync::CancellationToken,
+) -> Option<ParkedDrain> {
     let mut rx = match tokio::net::unix::pipe::Receiver::from_owned_fd(fd) {
         Ok(rx) => rx,
         Err(_) => return None,
@@ -2871,7 +2912,17 @@ fn sandbox_spawn_pipe_drain(fd: std::os::fd::OwnedFd) -> Option<ParkedDrain> {
     Some(ParkedDrain::Running(tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
-        let _ = rx.read_to_end(&mut buf).await;
+        loop {
+            buf.reserve(8192);
+            tokio::select! {
+                biased;
+                _ = cut.cancelled() => {
+                    while matches!(rx.try_read_buf(&mut buf), Ok(n) if n > 0) {}
+                    break;
+                }
+                n = rx.read_buf(&mut buf) => if !matches!(n, Ok(n) if n > 0) { break },
+            }
+        }
         buf
     })))
 }
@@ -2925,7 +2976,7 @@ fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {
     buf
 }
 
-fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
+pub(crate) fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
     use crate::result::ExitStatus;
     if libc::WIFEXITED(status) {
         ExitStatus::Code(libc::WEXITSTATUS(status))

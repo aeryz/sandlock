@@ -138,11 +138,13 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error)
   (`Stdin`/`Stdout`/`Stderr`) you read/write while the child runs. The zero
   `Stdio` inherits all three (identical to Spawn). Close a piped `Stdin` before
   `Wait` (or let `Wait` close it for you) so a reader child sees EOF; drain a
-  piped `Stdout`/`Stderr` before `Wait`, or `Kill` from another goroutine to
-  interrupt a blocked `Wait`. `Wait` returns a `Result` with the exit status
-  only — a Popen'd process sends piped output to the `Stdout`/`Stderr` fields
-  (inherited/null streams go to the parent fd or `/dev/null`), so (unlike `Run`)
-  `Result.Stdout`/`Result.Stderr` are always empty.
+  piped `Stdout`/`Stderr` while waiting, or `Kill` from another goroutine to
+  interrupt a blocked `Wait`. `Wait` returns the main process's `ExitStatus`
+  and leaves its background jobs supervised; `Shutdown` ends the session and
+  returns a `Result`. A Popen'd process sends piped output to the
+  `Stdout`/`Stderr` fields (inherited/null streams go to the parent fd or
+  `/dev/null`), so (unlike `Run`) `Result.Stdout`/`Result.Stderr` are always
+  empty.
 
 ```go
 p, _ := sb.Popen(sandlock.Stdio{Stdin: sandlock.StdioPiped, Stdout: sandlock.StdioPiped}, "cat")
@@ -150,7 +152,8 @@ defer p.Close()
 p.Stdin.Write([]byte("hi\n"))
 p.Stdin.Close()                 // EOF so cat exits
 out, _ := io.ReadAll(p.Stdout)  // "hi\n"
-res, _ := p.Wait()
+st, _ := p.Wait()               // main's ExitStatus
+res, _ := p.Shutdown()          // ends the session
 ```
 
 ### Container images
@@ -260,14 +263,19 @@ sb := &sandlock.Sandbox{
 
 ```go
 func (p *Process) Pid() int
-func (p *Process) Wait() (*Result, error)
-func (p *Process) Pause() error           // SIGSTOP to the process group
+func (p *Process) Wait() (*ExitStatus, error)   // main exited; background jobs keep running
+func (p *Process) WaitTimeout(d time.Duration) (*ExitStatus, error) // ErrTimeout leaves the session
+func (p *Process) Shutdown() (*Result, error)   // kill what is left, reap it, collect the result
+func (p *Process) ProcessGroups() ([]int, error) // groups that still have members
+func (p *Process) Pause() error           // SIGSTOP to every process group
 func (p *Process) Resume() error          // SIGCONT
 func (p *Process) Kill() error            // SIGKILL
 func (p *Process) Ports() (map[int]int, error) // virtual→real, with PortRemap
-func (p *Process) Close() error           // release the handle (kills if running), close piped streams
+func (p *Process) Close() error           // release the handle (ends the session), close piped streams
 
-// BranchActionDefer only: after Wait, the change set stays on the Process.
+// Kill, Pause and Resume work while another goroutine is blocked in Wait.
+
+// BranchActionDefer only: after Shutdown, the change set stays on the Process.
 func (p *Process) Pending() bool          // exited under Defer and undecided
 func (p *Process) UpperDir() string       // new bytes of added/modified files, laid out like Workdir
 func (p *Process) Commit() error          // merge into Workdir (blocks up to 5s on a contended workdir)

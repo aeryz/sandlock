@@ -149,9 +149,10 @@ def test_wait_is_idempotent_and_cached():
     proc = _policy().popen(["echo", "hi"], stdout=StdioMode.PIPED)
     assert proc.stdout.read() == b"hi\n"
     first = proc.wait()
-    second = proc.wait()  # handle already freed → cached result, no double-free
-    assert first is second
+    second = proc.wait()
+    assert first == second
     assert first.exit_code == 0
+    assert proc.shutdown() is proc.shutdown()
 
 
 def test_popen_unknown_stdio_mode_raises():
@@ -181,17 +182,19 @@ def test_popen_rejects_second_process_on_same_sandbox():
         proc.wait()
 
 
-def test_wait_timeout_kills_and_returns_nonsuccess():
-    # A child that never exits within the timeout: wait(timeout) must RETURN (not
-    # hang), killing the child and yielding a non-success result — parity with
-    # Sandbox.run(timeout=...). Run under a watchdog so a regression (ignored
-    # timeout → hang) surfaces as a failure, not a stuck job.
+def test_wait_timeout_raises_and_keeps_the_session():
+    # A child that never exits within the timeout: wait(timeout) must return
+    # promptly by raising TimeoutError and leave the session running. Run under
+    # a watchdog so an ignored timeout surfaces as a failure, not a stuck job.
     proc = _policy().popen(["sleep", "100"])
 
     box = {}
 
     def _run():
-        box["result"] = proc.wait(timeout=0.5)
+        try:
+            proc.wait(timeout=0.5)
+        except TimeoutError as e:
+            box["result"] = e
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -201,7 +204,9 @@ def test_wait_timeout_kills_and_returns_nonsuccess():
         t.join(timeout=5)
         pytest.fail("wait(timeout) did not return — timeout was ignored")
 
-    assert not box["result"].success, "a timed-out (killed) process is not success"
+    assert isinstance(box["result"], TimeoutError)
+    assert proc.pid is not None, "a timeout leaves the session running"
+    proc.shutdown()
 
 
 def test_wait_without_timeout_completes_for_quick_child():
@@ -256,18 +261,17 @@ def test_stale_process_does_not_alias_reused_sandbox():
     sandbox = _policy()
     p1 = sandbox.popen(["echo", "one"], stdout=StdioMode.PIPED)
     assert p1.stdout.read() == b"one\n"
-    p1.wait()  # frees p1's handle, releases the sandbox
+    p1.shutdown()  # frees p1's handle, releases the sandbox
 
     p2 = sandbox.popen(["sleep", "100"])
     try:
         assert sandbox.is_running
         p1.kill()  # no-op on the reaped p1 — must NOT kill p2
-        p1.wait()  # cached result — must NOT reap p2
+        p1.wait()  # cached status — must NOT reap p2
         assert sandbox.is_running, "stale p1 must not have reaped p2"
         assert p2.pid is not None, "p2 must still be alive"
     finally:
-        p2.kill()
-        p2.wait()
+        p2.shutdown()
     assert not sandbox.is_running
 
 
@@ -299,22 +303,24 @@ def test_sandbox_pid_and_ports_delegate_to_popen_process():
         assert sandbox.pid == proc.pid
         assert sandbox.ports() == proc.ports()  # both {} without port_remap
     finally:
-        proc.kill()
-        proc.wait()
+        proc.shutdown()
     assert sandbox.pid is None
     assert sandbox.ports() == {}
 
 
 def test_wait_timeout_zero_does_not_wait_forever():
     # timeout=0 (and sub-millisecond values) must not collapse to "wait forever";
-    # they return promptly with a non-success (killed) result. Watchdog so a
-    # regression surfaces as a failure, not a hang.
+    # they raise TimeoutError promptly. Watchdog so a regression surfaces as a
+    # failure, not a hang.
     proc = _policy().popen(["sleep", "100"])
 
     box = {}
 
     def _run():
-        box["result"] = proc.wait(timeout=0)
+        try:
+            proc.wait(timeout=0)
+        except TimeoutError as e:
+            box["result"] = e
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -324,7 +330,8 @@ def test_wait_timeout_zero_does_not_wait_forever():
         t.join(timeout=5)
         pytest.fail("wait(timeout=0) hung — 0 collapsed to wait-forever")
 
-    assert not box["result"].success
+    assert isinstance(box["result"], TimeoutError)
+    proc.shutdown()
 
 
 def test_abandoned_process_is_reaped_by_del():

@@ -534,3 +534,97 @@ async fn degraded_policy_confines_and_runs_below_v6() {
         "degraded-mode confinement must still execute the child"
     );
 }
+
+/// Kernels before 6.9 reject PIDFD_SIGNAL_PROCESS_GROUP. Re-run this test in
+/// a child that emulates one, so the filter never touches the test process.
+#[test]
+fn shutdown_without_pidfd_group_signals() {
+    const CHILD: &str = "SANDLOCK_TEST_NO_PIDFD_GROUP_SIGNALS";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["test_protection::shutdown_without_pidfd_group_signals", "--exact", "--nocapture"])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("shutdown hung without pidfd group signals");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    let filter = [
+        libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 0 },
+        libc::sock_filter { code: 0x15, jt: 0, jf: 3, k: libc::SYS_pidfd_send_signal as u32 },
+        libc::sock_filter { code: 0x20, jt: 0, jf: 0, k: 16 + 3 * 8 },
+        libc::sock_filter { code: 0x45, jt: 0, jf: 1, k: 1 << 2 },
+        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32 },
+        libc::sock_filter { code: 0x06, jt: 0, jf: 0, k: libc::SECCOMP_RET_ALLOW },
+    ];
+    let program = libc::sock_fprog { len: filter.len() as u16, filter: filter.as_ptr() as *mut _ };
+    unsafe {
+        assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+        assert_eq!(libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program), 0);
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path().display().to_string();
+    let mut builder = sandlock_core::Sandbox::builder();
+    for protection in Protection::all() {
+        builder = builder.allow_degraded(protection);
+    }
+    let policy = builder
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(dir.path())
+        .build()
+        .unwrap();
+    let job = |name: &str| -> i32 {
+        std::fs::read_to_string(dir.path().join(name)).unwrap().trim().parse().unwrap()
+    };
+    let publish = |name: &str| format!("open('{d}/{name}.tmp','w').write(str(os.getpid())); os.rename('{d}/{name}.tmp','{d}/{name}'); signal.pause()");
+    let wait_for = |name: &str| format!("while not os.path.exists('{d}/{name}'): time.sleep(0.01)");
+    let gone = |pid: i32| unsafe { libc::kill(pid, 0) } != 0;
+
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        // `cmd &` stays in main's group, which the live reaper pins.
+        let mut sb = policy.clone();
+        sb.spawn(&["sh", "-c", &format!("sleep 60 & echo $! > {d}/r; exit 7")]).await.unwrap();
+        assert_eq!(sb.wait().await.unwrap(), sandlock_core::ExitStatus::Code(7));
+        let background = job("r");
+        assert_eq!(sb.shutdown().await.unwrap().exit_status, sandlock_core::ExitStatus::Code(7));
+        assert!(gone(background));
+
+        // A setsid job whose leader lives is reached by number.
+        let mut sb = policy.clone();
+        let script = format!("import os,signal,time\nif os.fork()==0:\n os.setsid(); {}\n{}", publish("s"), wait_for("s"));
+        sb.spawn(&["python3", "-c", &script]).await.unwrap();
+        sb.wait().await.unwrap();
+        let leader = job("s");
+        sb.shutdown().await.unwrap();
+        assert!(gone(leader));
+
+        // A double-fork daemon outlived its leader: unreachable, so reported.
+        let mut sb = policy.clone();
+        let script = format!("import os,signal,time\nif os.fork()==0:\n os.setsid()\n if os.fork()==0:\n  {}\n os._exit(0)\n{}", publish("d"), wait_for("d"));
+        sb.spawn(&["python3", "-c", &script]).await.unwrap();
+        sb.wait().await.unwrap();
+        let daemon = job("d");
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(5), sb.shutdown()).await.unwrap().is_err());
+        drop(sb);
+        assert_eq!(unsafe { libc::kill(daemon, libc::SIGKILL) }, 0);
+    });
+}

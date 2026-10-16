@@ -180,7 +180,7 @@ async fn test_nested_sandbox() {
     // separately verifying that running Sandbox::run after another
     // Sandbox::run works (the seccomp filter stacks).
     outer_sb.kill().unwrap();
-    let _ = outer_sb.wait().await;
+    let _ = async { outer_sb.wait().await?; outer_sb.shutdown().await }.await;
 
     // Sequential sandboxes: first sandbox applies Landlock + seccomp,
     // second sandbox from the same parent gets EBUSY on seccomp
@@ -905,7 +905,7 @@ async fn test_cancelled_wait_keeps_the_capture_for_the_next_wait() {
 
     sb.kill().unwrap();
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), sb.wait())
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async { sb.wait().await?; sb.shutdown().await })
         .await
         .expect("the second wait() hung")
         .unwrap();

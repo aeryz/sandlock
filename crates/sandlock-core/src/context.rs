@@ -65,6 +65,15 @@ impl PipePair {
     }
 }
 
+/// Written on the exec pipe right before `execve`, which closes the pipe on
+/// success; `EXEC_FAILED` follows if `execve` returns.
+pub(crate) const EXEC_REACHED: u8 = b'e';
+pub(crate) const EXEC_FAILED: u8 = b'f';
+
+fn mark_exec(exec_w: RawFd, mark: u8) {
+    unsafe { libc::write(exec_w, [mark].as_ptr().cast(), 1) };
+}
+
 // ============================================================
 // Pipe I/O helpers
 // ============================================================
@@ -237,10 +246,6 @@ pub(crate) struct ChildSpawnArgs<'a> {
     /// Merged into the child's BPF notif list so the kernel actually
     /// raises USER_NOTIF for them.
     pub extra_syscalls: &'a [u32],
-    /// PID of the parent process captured before fork. Used to detect
-    /// parent death in the child without assuming PID 1 is always init
-    /// (incorrect in containers where the entrypoint runs as PID 1).
-    pub parent_pid: libc::pid_t,
     /// Make the child the terminal's foreground process group before exec.
     /// Only interactive (fully inherited) stdio wants this; a captured or
     /// piped run taking the foreground demotes the embedding process to a
@@ -291,7 +296,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         keep_fds,
         sandbox_name,
         extra_syscalls,
-        parent_pid,
         foreground,
     } = args;
     // Helper: abort child on error. Includes the OS error automatically.
@@ -305,6 +309,14 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
 
     use std::io::Write;
 
+    // Created here rather than before fork so that no sibling forked by the
+    // parent inherits the write end and holds back its EOF.
+    let mut exec_fds = [0i32; 2];
+    if unsafe { libc::pipe2(exec_fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        fail!("exec pipe");
+    }
+    let [exec_r, exec_w] = exec_fds;
+
     // 1. Interactive runs only: if stdin is a terminal, become the
     //     foreground process group so interactive shells can read from the
     //     TTY. Captured/piped runs must not: the embedding process keeps
@@ -317,19 +329,6 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             libc::tcsetpgrp(0, libc::getpgrp());
             libc::signal(libc::SIGTTOU, libc::SIG_DFL);
         }
-    }
-
-    // 2. Die if parent exits
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
-        fail!("prctl(PR_SET_PDEATHSIG)");
-    }
-
-    // 3. Check parent didn't die between fork and prctl.
-    // Compare against the actual parent PID captured before fork rather than
-    // hardcoding 1, since containers often run the entrypoint as PID 1 and a
-    // child forked from it legitimately has getppid() == 1.
-    if unsafe { libc::getppid() } != parent_pid {
-        fail!("parent died before confinement");
     }
 
     // 4. Optional: disable ASLR
@@ -527,6 +526,10 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         std::mem::forget(notif_fd);
     }
 
+    if let Err(e) = write_u32_fd(pipes.notif_w.as_raw_fd(), exec_r as u32) {
+        fail!(format!("write exec pipe fd: {}", e));
+    }
+
     // 10. Wait for parent to signal ready
     match read_u32_fd(pipes.ready_r.as_raw_fd()) {
         Ok(_) => {}
@@ -538,6 +541,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
     if keep_fd >= 0 {
         fds_to_keep.push(keep_fd);
     }
+    fds_to_keep.push(exec_w);
     close_fds_above(2, &fds_to_keep);
 
     // 13. Apply environment
@@ -607,6 +611,7 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
             // supervisor, so `run`'s code is already mapped; running it directly
             // avoids an execve that Landlock would otherwise have to authorize.
             set_proc_name(name);
+            unsafe { libc::close(exec_w) };
             run();
             unsafe { libc::_exit(0) };
         }
@@ -627,6 +632,8 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         .map(|s| s.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
+
+    mark_exec(exec_w, EXEC_REACHED);
 
     if let Some(fd) = exec_fd {
         extern "C" {
@@ -662,8 +669,10 @@ pub(crate) fn confine_child(args: ChildSpawnArgs<'_>) -> ! {
         unsafe { libc::execvp(argv_ptrs[0], argv_ptrs.as_ptr()) };
     }
 
-    // If we get here, exec failed
-    fail!(format!("exec '{}'", cmd[0].to_string_lossy()));
+    let exec_err = io::Error::last_os_error();
+    mark_exec(exec_w, EXEC_FAILED);
+    let _ = write!(std::io::stderr(), "sandlock child: exec '{}': {}\n", cmd[0].to_string_lossy(), exec_err);
+    unsafe { libc::_exit(127) };
 }
 
 // ============================================================
