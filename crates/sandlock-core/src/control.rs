@@ -851,7 +851,7 @@ mod tests {
             let controller = crate::Controller {
                 groups: Arc::new(crate::pgroup::ProcessGroups::new()),
                 stop: Default::default(),
-                main_exit: tokio::sync::watch::channel(None).1,
+                main_exit: crate::controller::MainExit::new(None),
                 pid: 0,
             };
             control_loop(sockets.control, None, controller, sandbox, info(), expected_uid).await;

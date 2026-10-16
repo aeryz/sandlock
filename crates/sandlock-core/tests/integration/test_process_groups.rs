@@ -271,6 +271,28 @@ async fn test_pid_is_gone_once_main_exits() {
     sb.shutdown().await.unwrap();
 }
 
+/// Main's status must not depend on a task of the runtime that created the
+/// sandbox.
+#[test]
+fn test_wait_on_another_runtime() {
+    let runtime = || tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+    let mut sb = Sandbox::builder()
+        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin")
+        .no_supervisor(true)
+        .build()
+        .unwrap();
+    let first = runtime();
+    first.block_on(sb.spawn(&["sh", "-c", "sleep 0.2; exit 3"])).unwrap();
+    drop(first);
+    let second = runtime();
+    let status = second
+        .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(5), sb.wait()).await })
+        .expect("wait() hangs")
+        .unwrap();
+    assert_eq!(status, sandlock_core::ExitStatus::Code(3));
+    second.block_on(sb.shutdown()).unwrap();
+}
+
 #[tokio::test]
 async fn test_spawn_reports_a_failed_exec() {
     let mut sb = policy();

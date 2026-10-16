@@ -136,18 +136,27 @@ unsafe fn supervise(main: i32, group: i32, status_fd: i32, finish_fd: i32, signa
     ];
     loop {
         loop {
-            let mut status = 0;
-            match libc::waitpid(-1, &mut status, libc::WNOHANG | libc::__WALL) {
-                0 => break,
-                pid if pid == main => {
-                    send(status_fd, &status.to_le_bytes());
-                    libc::close(status_fd);
+            // WNOWAIT: main's status is sent before its pid is freed, so no
+            // reader can see main alive once that number is reusable.
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            if libc::waitid(libc::P_ALL, 0, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT | libc::__WALL) < 0 {
+                if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
                 }
-                pid if pid > 0 => {}
-                _ if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => {}
                 // No child left means no session process left.
-                _ => libc::_exit(0),
+                libc::_exit(0);
             }
+            let pid = info.si_pid();
+            if pid == 0 {
+                break;
+            }
+            if pid == main {
+                send(status_fd, &wait_status(&info).to_le_bytes());
+                libc::close(status_fd);
+            }
+            while libc::waitpid(pid, std::ptr::null_mut(), libc::__WALL) < 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+            {}
         }
         libc::poll(poll.as_mut_ptr(), 3, -1);
         // Owner death also closes its end of the finish pipe, so it must be
@@ -163,6 +172,16 @@ unsafe fn supervise(main: i32, group: i32, status_fd: i32, finish_fd: i32, signa
             let mut info: libc::signalfd_siginfo = std::mem::zeroed();
             libc::read(signal_fd, (&mut info as *mut libc::signalfd_siginfo).cast(), std::mem::size_of_val(&info));
         }
+    }
+}
+
+/// The raw wait status that `waitpid` would have returned for `info`.
+unsafe fn wait_status(info: &libc::siginfo_t) -> i32 {
+    let status = info.si_status();
+    match info.si_code {
+        libc::CLD_EXITED => (status & 0xff) << 8,
+        libc::CLD_DUMPED => status | 0x80,
+        _ => status,
     }
 }
 

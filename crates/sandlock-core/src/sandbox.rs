@@ -291,7 +291,7 @@ struct Runtime {
     reaper: Option<crate::reaper::Reaper>,
     /// Main's process group: the reaper's pid, or a clone's own pid.
     pgid: i32,
-    main_exit: tokio::sync::watch::Sender<Option<crate::result::ExitStatus>>,
+    main_exit: Arc<crate::controller::MainExit>,
     groups: Arc<crate::pgroup::ProcessGroups>,
     /// Cancelled by a kill, so a held policy_fn verdict cannot stall it.
     stop: tokio_util::sync::CancellationToken,
@@ -869,7 +869,7 @@ impl Sandbox {
     /// Main's pid until it exits; afterwards the number may name another process.
     pub fn pid(&self) -> Option<i32> {
         self.runtime.as_ref()
-            .filter(|rt| rt.main_exit.borrow().is_none())
+            .filter(|rt| rt.main_exit.get().is_none())
             .and_then(|rt| rt.child_pid)
     }
 
@@ -896,7 +896,7 @@ impl Sandbox {
         Ok(crate::Controller {
             groups: Arc::clone(&rt.groups),
             stop: rt.stop.clone(),
-            main_exit: rt.main_exit.subscribe(),
+            main_exit: Arc::clone(&rt.main_exit),
             pid: rt.child_pid.unwrap_or(0),
         })
     }
@@ -1010,11 +1010,8 @@ impl Sandbox {
         // `spawn_pid_watcher`. Falls back to a blocking `waitpid` only when no
         // pidfd is available (kernel without `pidfd_open`).
         let exit_status = if self.rt().reaper.is_some() {
-            let mut main_exit = self.rt().main_exit.subscribe();
-            let status = main_exit.wait_for(|s| s.is_some()).await
-                .map(|s| s.clone().expect("checked"))
-                .unwrap_or(crate::result::ExitStatus::Killed);
-            status
+            let main_exit = Arc::clone(&self.rt().main_exit);
+            main_exit.wait().await.map_err(SandboxRuntimeError::Io)?
         } else {
             match self.rt_mut().pidfd.take() {
                 Some(pidfd) => wait_child_exit_via_pidfd(pidfd, pid).await,
@@ -1022,7 +1019,7 @@ impl Sandbox {
             }
         };
         self.rt_mut().state = RuntimeState::MainExited(exit_status.clone());
-        self.rt().main_exit.send_replace(Some(exit_status.clone()));
+        self.rt().main_exit.set(exit_status.clone());
 
         if self.rt().tty_foreground_taken {
             sandbox_restore_tty_foreground(self.rt().pgid);
@@ -1711,7 +1708,7 @@ impl Sandbox {
                 pidfd: None,
                 reaper: None,
                 pgid: clone_pid,
-                main_exit: tokio::sync::watch::channel(None).0,
+                main_exit: crate::controller::MainExit::new(None),
                 stop: tokio_util::sync::CancellationToken::new(),
                 drain_cut: tokio_util::sync::CancellationToken::new(),
                 groups: Arc::new(crate::pgroup::ProcessGroups::new()),
@@ -1823,7 +1820,7 @@ impl Sandbox {
             pidfd: None,
             reaper: None,
             pgid: 0,
-            main_exit: tokio::sync::watch::channel(None).0,
+            main_exit: crate::controller::MainExit::new(None),
             stop: tokio_util::sync::CancellationToken::new(),
             drain_cut: tokio_util::sync::CancellationToken::new(),
             groups: Arc::new(crate::pgroup::ProcessGroups::new()),
@@ -2215,7 +2212,7 @@ impl Sandbox {
         let key = reaper.pidfd.try_clone().map_err(SandboxRuntimeError::Io)?;
         self.rt_mut().groups.track(reaper.pid, key);
         self.rt_mut().pgid = reaper.pid;
-        spawn_main_exit_watch(status, self.rt().main_exit.clone());
+        self.rt_mut().main_exit = crate::controller::MainExit::new(Some(status));
         self.rt_mut().reaper = Some(reaper);
         let pidfd = syscall::pidfd_open(pid as u32, 0).ok();
 
@@ -2980,29 +2977,7 @@ fn sandbox_read_fd_to_end(fd: std::os::fd::OwnedFd) -> Vec<u8> {
     buf
 }
 
-/// Main's status arrives once on the reaper's pipe; the slot keeps it for
-/// `wait()` and for `ps`, whether or not anyone is waiting yet.
-fn spawn_main_exit_watch(
-    status: std::os::fd::OwnedFd,
-    tx: tokio::sync::watch::Sender<Option<crate::result::ExitStatus>>,
-) {
-    use tokio::io::AsyncReadExt;
-    tokio::spawn(async move {
-        let mut raw = [0u8; 4];
-        let read = match tokio::net::unix::pipe::Receiver::from_owned_fd(status) {
-            Ok(mut pipe) => pipe.read_exact(&mut raw).await.is_ok(),
-            Err(_) => false,
-        };
-        let exit = if read {
-            sandbox_wait_status_to_exit(i32::from_le_bytes(raw))
-        } else {
-            crate::result::ExitStatus::Killed
-        };
-        tx.send_replace(Some(exit));
-    });
-}
-
-fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
+pub(crate) fn sandbox_wait_status_to_exit(status: i32) -> crate::result::ExitStatus {
     use crate::result::ExitStatus;
     if libc::WIFEXITED(status) {
         ExitStatus::Code(libc::WEXITSTATUS(status))

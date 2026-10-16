@@ -1,6 +1,7 @@
 //! Acts on a running session while `Sandbox::wait()` holds it mutably.
 
-use std::sync::Arc;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::{Arc, Mutex};
 
 use crate::error::{SandboxRuntimeError, SandlockError};
 use crate::result::ExitStatus;
@@ -9,7 +10,7 @@ use crate::result::ExitStatus;
 pub struct Controller {
     pub(crate) groups: Arc<crate::pgroup::ProcessGroups>,
     pub(crate) stop: tokio_util::sync::CancellationToken,
-    pub(crate) main_exit: tokio::sync::watch::Receiver<Option<ExitStatus>>,
+    pub(crate) main_exit: Arc<MainExit>,
     pub(crate) pid: i32,
 }
 
@@ -32,7 +33,7 @@ impl Controller {
     }
 
     pub fn main_exited(&self) -> bool {
-        self.main_exit.borrow().is_some()
+        self.main_exit.get().is_some()
     }
 
     /// Main's pid until it exits; afterwards the number may name another process.
@@ -53,5 +54,58 @@ impl Controller {
             return Err(SandboxRuntimeError::Io(std::io::Error::from_raw_os_error(libc::ESRCH)).into());
         }
         Ok(())
+    }
+}
+
+/// Main's exit status, read straight from the reaper's status pipe so that no
+/// background task, and no particular runtime, has to be alive to learn it.
+pub(crate) struct MainExit {
+    pipe: Option<OwnedFd>,
+    status: Mutex<Option<ExitStatus>>,
+}
+
+impl MainExit {
+    /// `pipe` carries main's raw wait status as four bytes; without one, the
+    /// owner publishes the status through [`MainExit::set`].
+    pub(crate) fn new(pipe: Option<OwnedFd>) -> Arc<Self> {
+        if let Some(fd) = &pipe {
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+        }
+        Arc::new(MainExit { pipe, status: Mutex::new(None) })
+    }
+
+    pub(crate) fn get(&self) -> Option<ExitStatus> {
+        let mut status = self.status.lock().unwrap();
+        if status.is_none() {
+            if let Some(fd) = &self.pipe {
+                let mut raw = [0u8; 4];
+                let n = unsafe { libc::read(fd.as_raw_fd(), raw.as_mut_ptr().cast(), raw.len()) };
+                *status = match n {
+                    4 => Some(crate::sandbox::sandbox_wait_status_to_exit(i32::from_le_bytes(raw))),
+                    // The write is atomic, so anything else but EAGAIN means
+                    // the reaper died without reporting main.
+                    n if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock => None,
+                    _ => Some(ExitStatus::Killed),
+                };
+            }
+        }
+        status.clone()
+    }
+
+    pub(crate) fn set(&self, exit: ExitStatus) {
+        self.status.lock().unwrap().get_or_insert(exit);
+    }
+
+    pub(crate) async fn wait(&self) -> std::io::Result<ExitStatus> {
+        let Some(fd) = &self.pipe else {
+            return Err(std::io::Error::other("main's exit has no status pipe"));
+        };
+        let ready = tokio::io::unix::AsyncFd::with_interest(fd.as_raw_fd(), tokio::io::Interest::READABLE)?;
+        loop {
+            if let Some(exit) = self.get() {
+                return Ok(exit);
+            }
+            ready.readable().await?.clear_ready();
+        }
     }
 }
