@@ -238,6 +238,34 @@ async fn test_shutdown_returns_output_while_a_job_holds_stdout() {
     assert_eq!(result.stdout.as_deref(), Some(b"main-output\n".as_slice()));
 }
 
+/// The reaper collects a main that exits right after exec before spawn()
+/// can see its new image; spawn() must still report success.
+#[tokio::test]
+async fn test_spawn_of_an_instantly_exiting_main() {
+    for _ in 0..50 {
+        let mut sb = policy();
+        sb.spawn(&["true"]).await.unwrap();
+        assert_eq!(sb.wait().await.unwrap(), sandlock_core::ExitStatus::Code(0));
+        sb.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_spawn_beside_a_parked_sibling() {
+    let mut parked = policy();
+    parked.create(&["true"]).await.unwrap();
+    let mut sb = policy();
+    tokio::time::timeout(std::time::Duration::from_secs(5), sb.spawn(&["true"])).await.unwrap().unwrap();
+    sb.wait().await.unwrap();
+    sb.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_spawn_reports_a_failed_exec() {
+    let mut sb = policy();
+    assert!(sb.spawn(&["/nonexistent-sandlock-binary"]).await.is_err());
+}
+
 #[tokio::test]
 async fn test_shutdown_ends_a_paused_session() {
     let mut sb = policy();

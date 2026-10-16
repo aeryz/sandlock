@@ -330,6 +330,8 @@ struct Runtime {
     on_bind: Option<Box<dyn Fn(&HashMap<u16, u16>) + Send + Sync>>,
     handlers: Vec<(i64, Arc<dyn crate::seccomp::dispatch::Handler>)>,
     ready_w: Option<std::os::fd::OwnedFd>,
+    /// The child's exec pipe: EOF after `EXEC_REACHED` alone means it exec'd.
+    exec_r: Option<std::os::fd::OwnedFd>,
     /// Set when this sandbox is a stage of a [`Transaction`](crate::transaction::Transaction)
     /// that shares one COW upper across all stages. When present, `do_create_stdio`
     /// reuses this `CowState` (instead of building its own branch), and neither
@@ -1365,43 +1367,34 @@ impl Sandbox {
         &self.restore_skipped
     }
 
-    /// Wait for the child to finish `execve`. Detected by `/proc/<pid>/exe`
-    /// no longer matching `/proc/self/exe` (before execve the child still
-    /// shares the supervisor's binary). The kernel offers no direct event
-    /// for execve completion, so this polls every 1ms. Policy approvals add
-    /// their configured timeout to the usual five-second startup allowance;
-    /// unlimited approvals also disable the startup deadline.
-    async fn wait_until_exec(&self) -> Result<(), crate::error::SandlockError> {
+    /// Wait for the child to finish `execve`, which closes its exec pipe.
+    /// Policy approvals add their configured timeout to the usual five-second
+    /// startup allowance; unlimited approvals also disable the startup deadline.
+    async fn wait_until_exec(&mut self) -> Result<(), crate::error::SandlockError> {
         use crate::error::SandboxRuntimeError;
-        let pid = self.pid().ok_or(SandboxRuntimeError::NotRunning)?;
-        let Some(our_exe) = std::fs::read_link("/proc/self/exe").ok() else {
-            return Ok(());
-        };
-        let child_link = format!("/proc/{}/exe", pid);
+        use tokio::io::AsyncReadExt;
+        let exec_r = self.rt_mut().exec_r.take().ok_or(SandboxRuntimeError::NotRunning)?;
+        let mut exec_r = tokio::net::unix::pipe::Receiver::from_owned_fd(exec_r)
+            .map_err(SandboxRuntimeError::Io)?;
         let startup_allowance = Duration::from_secs(5);
         let timeout = if let Some(policy_fn) = &self.policy_fn {
             policy_fn.verdict_timeout.map(|timeout| timeout.saturating_add(startup_allowance))
         } else {
             Some(startup_allowance)
         };
-        let deadline = timeout.and_then(|timeout| std::time::Instant::now().checked_add(timeout));
-        loop {
-            match std::fs::read_link(&child_link) {
-                Ok(child_exe) if child_exe != our_exe => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(SandboxRuntimeError::Child(
-                        "child exited before exec() completed".into(),
-                    ).into());
-                }
-                _ => {}
-            }
-            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                return Err(SandboxRuntimeError::Child(
-                    "child did not exec() within the startup timeout".into(),
-                ).into());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let mut marks = Vec::new();
+        let read = exec_r.read_to_end(&mut marks);
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, read).await.map_err(|_| {
+                SandboxRuntimeError::Child("child did not exec() within the startup timeout".into())
+            })?,
+            None => read.await,
         }
+        .map_err(SandboxRuntimeError::Io)?;
+        if marks != [context::EXEC_REACHED] {
+            return Err(SandboxRuntimeError::Child("child exited before exec() completed".into()).into());
+        }
+        Ok(())
     }
 
     /// Create with explicit stdin/stdout/stderr fd redirection. Child is
@@ -1743,6 +1736,7 @@ impl Sandbox {
                 on_bind: None,
                 handlers: Vec::new(),
                 ready_w: None,
+                exec_r: None,
                 #[cfg(feature = "cow")]
                 shared_cow: None,
                 tty_foreground_taken: false,
@@ -1856,6 +1850,7 @@ impl Sandbox {
             on_bind: None,
             handlers: Vec::new(),
             ready_w: None,
+            exec_r: None,
             #[cfg(feature = "cow")]
             shared_cow: None,
             tty_foreground_taken: false,
@@ -2224,6 +2219,21 @@ impl Sandbox {
 
         let notif_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
             .map_err(|e| SandboxRuntimeError::Child(format!("read notif fd from child: {}", e)))?;
+        let exec_fd_num = read_u32_fd(pipes.notif_r.as_raw_fd())
+            .map_err(|e| SandboxRuntimeError::Child(format!("read exec pipe fd from child: {}", e)))?;
+        let take_child_fd = |num: u32, flags: i32| -> Result<OwnedFd, SandboxRuntimeError> {
+            if let Some(ref pfd) = pidfd {
+                return syscall::pidfd_getfd(pfd, num as i32, 0)
+                    .map_err(|e| SandboxRuntimeError::Child(format!("pidfd_getfd: {}", e)));
+            }
+            let cpath = CString::new(format!("/proc/{}/fd/{}", pid, num)).unwrap();
+            let raw = unsafe { libc::open(cpath.as_ptr(), flags | libc::O_CLOEXEC) };
+            if raw < 0 {
+                return Err(SandboxRuntimeError::Child(format!("failed to open child fd {} from /proc", num)));
+            }
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
+        let exec_r = take_child_fd(exec_fd_num, libc::O_RDONLY)?;
 
         let control_info = crate::control::SandboxInfo { mode: self.mode.clone(), main_exited: false };
 
@@ -2231,17 +2241,8 @@ impl Sandbox {
 
         let notif_fd = if is_nested_mode {
             None
-        } else if let Some(ref pfd) = pidfd {
-            Some(syscall::pidfd_getfd(pfd, notif_fd_num as i32, 0)
-                .map_err(|e| SandboxRuntimeError::Child(format!("pidfd_getfd: {}", e)))?)
         } else {
-            let path = format!("/proc/{}/fd/{}", pid, notif_fd_num);
-            let cpath = CString::new(path).unwrap();
-            let raw = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
-            if raw < 0 {
-                return Err(SandboxRuntimeError::Child("failed to open notif fd from /proc".into()).into());
-            }
-            Some(unsafe { OwnedFd::from_raw_fd(raw) })
+            Some(take_child_fd(notif_fd_num, libc::O_RDWR)?)
         };
 
         if let Some(notif_fd) = notif_fd {
@@ -2520,6 +2521,7 @@ impl Sandbox {
 
         self.rt_mut().pidfd = pidfd;
         self.rt_mut().ready_w = Some(pipes.ready_w);
+        self.rt_mut().exec_r = Some(exec_r);
 
         Ok(())
     }
