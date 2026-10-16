@@ -1481,7 +1481,11 @@ impl Sandbox {
     #[cfg(feature = "checkpoint")]
     pub async fn checkpoint(&self) -> Result<crate::checkpoint::Checkpoint, crate::error::SandlockError> {
         use crate::error::{SandboxRuntimeError, SandlockError};
+        // The reaper reaps main as soon as it exits, so its pid may already
+        // name an unrelated process.
         let pid = self.runtime.as_ref()
+            .filter(|rt| rt.main_exit.borrow().is_none())
+            .filter(|rt| !matches!(rt.state, RuntimeState::MainExited(_) | RuntimeState::Stopped(_)))
             .and_then(|rt| rt.child_pid)
             .ok_or(SandlockError::Runtime(SandboxRuntimeError::NotRunning))?;
         self.checkpoint_pid(pid).await
