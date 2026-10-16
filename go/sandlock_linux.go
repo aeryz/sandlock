@@ -876,9 +876,9 @@ type Process struct {
 	h        *C.sandlock_handle_t
 	waiting  int           // Waits in the native call
 	waitDone chan struct{} // closed when the last of them returns
-	status  *ExitStatus // main's status once a Wait has seen it
-	result  *Result     // the session's result once Shutdown has run
-	pending bool        // the run exited under BranchActionDefer; Commit/Abort own the handle now
+	status   *ExitStatus   // main's status once a Wait has seen it
+	result   *Result       // the session's result once Shutdown has run
+	pending  bool          // the run exited under BranchActionDefer; Commit/Abort own the handle now
 
 	// Caller-owned stdio for a process started by Popen. Each is non-nil only
 	// for a stream wired StdioPiped; it owns the pipe fd (closing the file
