@@ -289,8 +289,6 @@ struct Runtime {
     child_pid: Option<i32>,
     pidfd: Option<std::os::fd::OwnedFd>,
     reaper: Option<crate::reaper::Reaper>,
-    /// Main's process group: the reaper's pid, or a clone's own pid.
-    pgid: i32,
     main_exit: Arc<crate::controller::MainExit>,
     groups: Arc<crate::pgroup::ProcessGroups>,
     /// Cancelled by a kill, so a held policy_fn verdict cannot stall it.
@@ -1022,8 +1020,7 @@ impl Sandbox {
         self.rt().main_exit.set(exit_status.clone());
 
         if self.rt().tty_foreground_taken {
-            sandbox_restore_tty_foreground(self.rt().pgid);
-            self.rt_mut().tty_foreground_taken = false;
+            sandbox_restore_tty_foreground(&self.rt().groups);
         }
         Ok(exit_status)
     }
@@ -1045,6 +1042,11 @@ impl Sandbox {
                 if no_supervisor || swept.is_err() { reaper.finish(); }
                 reaper.join().await;
                 self.rt().drain_cut.cancel();
+            }
+            // A job that outlived main may have taken the terminal back.
+            if self.rt().tty_foreground_taken {
+                sandbox_restore_tty_foreground(&self.rt().groups);
+                self.rt_mut().tty_foreground_taken = false;
             }
             self.rt_mut().state = RuntimeState::Stopped(exit_status);
 
@@ -1707,7 +1709,6 @@ impl Sandbox {
                 child_pid: Some(clone_pid),
                 pidfd: None,
                 reaper: None,
-                pgid: clone_pid,
                 main_exit: crate::controller::MainExit::new(None),
                 stop: tokio_util::sync::CancellationToken::new(),
                 drain_cut: tokio_util::sync::CancellationToken::new(),
@@ -1819,7 +1820,6 @@ impl Sandbox {
             child_pid: None,
             pidfd: None,
             reaper: None,
-            pgid: 0,
             main_exit: crate::controller::MainExit::new(None),
             stop: tokio_util::sync::CancellationToken::new(),
             drain_cut: tokio_util::sync::CancellationToken::new(),
@@ -2211,7 +2211,6 @@ impl Sandbox {
         let status = reaper.take_status().expect("fresh reaper");
         let key = reaper.pidfd.try_clone().map_err(SandboxRuntimeError::Io)?;
         self.rt_mut().groups.track(reaper.pid, key);
-        self.rt_mut().pgid = reaper.pid;
         self.rt_mut().main_exit = crate::controller::MainExit::new(Some(status));
         self.rt_mut().reaper = Some(reaper);
         let pidfd = syscall::pidfd_open(pid as u32, 0).ok();
@@ -2625,14 +2624,14 @@ impl Process<'_> {
 }
 
 /// Hand the terminal's foreground process group back to this process after
-/// reaping an interactive child that took it. Restores only while the child's
-/// group still owns the terminal, so a foreground the caller has since given
-/// to someone else is left alone. SIGTTOU is blocked around `tcsetpgrp`:
+/// reaping an interactive child that took it. Restores only while one of the
+/// sandbox's groups holds the terminal, so a foreground the caller has since
+/// given to someone else is left alone. SIGTTOU is blocked around `tcsetpgrp`:
 /// this process is a background group at that moment, and an unblocked
 /// SIGTTOU would stop it, which is the exact symptom being prevented.
-fn sandbox_restore_tty_foreground(pgid: i32) {
+fn sandbox_restore_tty_foreground(groups: &crate::pgroup::ProcessGroups) {
     unsafe {
-        if libc::isatty(0) != 1 || libc::tcgetpgrp(0) != pgid {
+        if libc::isatty(0) != 1 || !groups.tracks(libc::tcgetpgrp(0)) {
             return;
         }
         let mut block: libc::sigset_t = std::mem::zeroed();
@@ -2667,7 +2666,7 @@ impl Drop for Sandbox {
                     }
                 }
                 if rt.tty_foreground_taken {
-                    sandbox_restore_tty_foreground(rt.pgid);
+                    sandbox_restore_tty_foreground(&rt.groups);
                     rt.tty_foreground_taken = false;
                 }
             }

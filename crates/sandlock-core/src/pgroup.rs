@@ -52,6 +52,11 @@ impl ProcessGroups {
             .unwrap_or(false)
     }
 
+    /// Whether `pgid` was a group of this sandbox, members or not.
+    pub fn tracks(&self, pgid: i32) -> bool {
+        self.leaders.lock().map(|leaders| leaders.contains_key(&pgid)).unwrap_or(false)
+    }
+
     /// Sorted pgids that still have members.
     pub fn live(&self) -> io::Result<Vec<i32>> {
         let leaders = self.leaders.lock()

@@ -170,3 +170,50 @@ fn interactive_run_hands_tty_foreground_to_child_while_alive() {
          13=child never got the tty foreground, 14=tty foreground not returned after reap)"
     );
 }
+
+/// A job that outlives main can take the terminal back after wait() returned
+/// it; shutdown() kills that job and must not leave the caller in the
+/// background.
+#[test]
+fn shutdown_returns_tty_foreground_taken_by_a_job() {
+    if !std::path::Path::new("/usr/bin/python3").exists() {
+        return;
+    }
+    let code = run_in_pty_session(|| {
+        block_on(async {
+            let name = format!("tty-job-steal-{}", std::process::id());
+            let mut policy = test_policy().with_name(&name);
+            let script = "import os, signal, time\n\
+                          signal.signal(signal.SIGTTOU, signal.SIG_IGN)\n\
+                          if os.fork() == 0:\n    \
+                              time.sleep(0.3)\n    \
+                              os.tcsetpgrp(0, os.getpgrp())\n    \
+                              time.sleep(60)\n";
+            if policy.spawn_interactive(&["python3", "-c", script]).await.is_err() {
+                return EXIT_RUN_FAILED;
+            }
+            if policy.wait().await.is_err() {
+                return EXIT_RUN_FAILED;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while unsafe { libc::tcgetpgrp(0) == libc::getpgrp() } {
+                if std::time::Instant::now() > deadline {
+                    return EXIT_FOREGROUND_NOT_TAKEN;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            if policy.shutdown().await.is_err() {
+                return EXIT_RUN_FAILED;
+            }
+            if unsafe { libc::tcgetpgrp(0) != libc::getpgrp() } {
+                return EXIT_FOREGROUND_NOT_RESTORED;
+            }
+            EXIT_OK
+        })
+    });
+    assert_eq!(
+        code, EXIT_OK,
+        "helper exit {code} (10=no tty foreground at start, 11=spawn/wait/shutdown failed, \
+         13=the job never took the tty foreground, 14=tty foreground not returned after shutdown)"
+    );
+}
