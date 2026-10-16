@@ -795,7 +795,7 @@ class TestPauseResume:
         assert pid > 0
 
         sb.wait()
-        assert sb.pid == pid, "the session outlives its main process"
+        assert sb.pid is None, "an exited main's pid may already be reused"
         sb.shutdown()
         assert sb.pid is None
 

@@ -1408,7 +1408,7 @@ pub unsafe extern "C" fn sandlock_handle_pid(h: *const sandlock_handle_t) -> i32
     if h.is_null() {
         return 0;
     }
-    (*h).sandbox.pid().unwrap_or(0)
+    handle_controller(h).and_then(|c| c.pid()).unwrap_or(0)
 }
 
 /// Send SIGKILL to every process group of the session. Idempotent: a session

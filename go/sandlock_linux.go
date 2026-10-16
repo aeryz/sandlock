@@ -874,7 +874,6 @@ func SyscallNr(name string) (int, error) {
 type Process struct {
 	mu       sync.Mutex
 	h        *C.sandlock_handle_t
-	pid      int
 	waiting  int           // Waits in the native call
 	waitDone chan struct{} // closed when the last of them returns
 	status  *ExitStatus // main's status once a Wait has seen it
@@ -918,7 +917,7 @@ func (s *Sandbox) Spawn(cmd ...string) (*Process, error) {
 		C.sandlock_handle_free(h)
 		return nil, fmt.Errorf("sandlock: failed to start sandbox")
 	}
-	p := &Process{h: h, pid: int(C.sandlock_handle_pid(h))}
+	p := &Process{h: h}
 	// Last-resort cleanup if the caller drops the Process without
 	// Shutdown/Close: freeing the handle kills and reaps the session.
 	// Shutdown and Close clear this once they have done the cleanup.
@@ -983,7 +982,6 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error) {
 	}
 	p := &Process{
 		h:      h,
-		pid:    int(C.sandlock_handle_pid(h)),
 		Stdin:  fdFile(fdIn, "sandlock-stdin"),
 		Stdout: fdFile(fdOut, "sandlock-stdout"),
 		Stderr: fdFile(fdErr, "sandlock-stderr"),
@@ -1008,11 +1006,15 @@ func (p *Process) finalize() {
 	p.h = nil
 }
 
-// Pid returns the child process ID, or 0 if it is not available.
+// Pid returns main's process ID until it exits, else 0: the number may then
+// name another process.
 func (p *Process) Pid() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.pid
+	if p.h == nil || p.pending {
+		return 0
+	}
+	return int(C.sandlock_handle_pid(p.h))
 }
 
 // Wait blocks until the main process exits and returns its status. Background

@@ -852,6 +852,7 @@ mod tests {
                 groups: Arc::new(crate::pgroup::ProcessGroups::new()),
                 stop: Default::default(),
                 main_exit: tokio::sync::watch::channel(None).1,
+                pid: 0,
             };
             control_loop(sockets.control, None, controller, sandbox, info(), expected_uid).await;
         })

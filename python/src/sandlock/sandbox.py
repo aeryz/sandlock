@@ -535,7 +535,6 @@ class Sandbox:
                               # own handle (see `_popen_process`), this is only a
                               # non-owning busy marker
         self._restore_skipped = []  # SkippedFd entries from the last restore
-        self._pid = None
         # Every native call on _handle except a wait runs under this lock, so
         # none can use a handle that shutdown() is freeing; waits only count
         # themselves in and out, so a signal can reach a blocked wait.
@@ -642,14 +641,15 @@ class Sandbox:
 
     @property
     def pid(self) -> int | None:
-        """Child PID while running, None otherwise. Reflects a running child from
-        either the sandbox lifecycle or a live :meth:`popen` :class:`Process`."""
+        """Main's PID until it exits, None otherwise. Reflects a running child
+        from either the sandbox lifecycle or a live :meth:`popen` :class:`Process`."""
         proc = self._popen_process()
         if proc is not None:
-            # The Process owns the handle; its pid is lock-guarded and cached, so
-            # reading it can't race a concurrent wait() freeing the handle.
             return proc.pid
-        return self._pid if self._handle is not None else None
+        with self._idle:
+            if self._handle is None:
+                return None
+            return _main_pid(self._handle)
 
     @property
     def is_running(self) -> bool:
@@ -992,7 +992,6 @@ class Sandbox:
         )
         if not self._handle:
             raise RuntimeError("sandlock_create failed")
-        self._pid = _lib.sandlock_handle_pid(self._handle) or None
 
     def start(self) -> None:
         """Release a previously ``create()``d child to ``execve`` the
@@ -1401,7 +1400,6 @@ class Sandbox:
         if not handle:
             raise RuntimeError("checkpoint restore failed")
         self._handle = handle
-        self._pid = _lib.sandlock_handle_pid(handle) or None
         # Copy the skipped-fd diagnostics out eagerly: the native entries live
         # on the handle, which shutdown() frees.
         skipped = []
@@ -1535,11 +1533,10 @@ class Process:
         # waits only count themselves in and out.
         self._idle = threading.Condition()
         self._waiting = 0
-        # The handle and pid are set only AFTER the fds are wrapped below: if an
+        # The handle is set only AFTER the fds are wrapped below: if an
         # fdopen raises, this Process never takes ownership, so popen()'s caller
         # frees the handle exactly once (no double free via __del__).
         self._handle = None
-        self._pid = -1
         self._result = None
         self.stdin = self.stdout = self.stderr = None
         # os.fdopen takes ownership of each fd: closing the stream closes the fd,
@@ -1568,14 +1565,15 @@ class Process:
             raise
         self.stdin, self.stdout, self.stderr = opened
         # Take ownership now that construction can no longer fail.
-        self._pid = _lib.sandlock_handle_pid(handle) or -1
         self._handle = handle
 
     @property
     def pid(self) -> int | None:
-        """The child PID until :meth:`shutdown`, else ``None``."""
+        """Main's PID until it exits, else ``None``."""
         with self._idle:
-            return self._pid if self._handle is not None and self._pid > 0 else None
+            if self._handle is None:
+                return None
+            return _main_pid(self._handle)
 
     def ports(self) -> dict[int, int]:
         """Current virtual→real port mappings while running, else ``{}`` (needs
@@ -1745,6 +1743,11 @@ def _process_groups(handle):
         return json.loads(ctypes.string_at(ptr))
     finally:
         _lib.sandlock_string_free(ctypes.cast(ptr, ctypes.c_char_p))
+
+
+def _main_pid(handle):
+    from ._sdk import _lib
+    return _lib.sandlock_handle_pid(handle) or None
 
 
 def _send_signal(handle, name):

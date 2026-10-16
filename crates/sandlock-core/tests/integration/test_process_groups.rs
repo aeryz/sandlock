@@ -261,6 +261,17 @@ async fn test_spawn_beside_a_parked_sibling() {
 }
 
 #[tokio::test]
+async fn test_pid_is_gone_once_main_exits() {
+    let mut sb = policy();
+    sb.spawn(&["sh", "-c", "sleep 60 & exit 0"]).await.unwrap();
+    let controller = sb.controller().unwrap();
+    sb.wait().await.unwrap();
+    assert_eq!(sb.pid(), None);
+    assert_eq!(controller.pid(), None);
+    sb.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn test_spawn_reports_a_failed_exec() {
     let mut sb = policy();
     assert!(sb.spawn(&["/nonexistent-sandlock-binary"]).await.is_err());

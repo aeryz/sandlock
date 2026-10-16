@@ -617,8 +617,6 @@ pub async fn run(args: LearnArgs) -> Result<()> {
 
     eprintln!("sandlock learn: observing {cmd_str} ...");
 
-    // Use the three-step lifecycle (create/start/wait) so we can get the child
-    // PID from sandbox.pid() and sample /proc/<pid> for resource peaks.
     let mut sandbox = policy;
     sandbox.create_interactive(&cmd_refs).await
         .map_err(|e| anyhow!("sandbox error: {e}"))?;

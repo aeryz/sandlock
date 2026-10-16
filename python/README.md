@@ -418,7 +418,7 @@ The sandbox name.
 
 #### `sandbox.pid -> int | None`
 
-The child PID while running, `None` otherwise.
+Main's PID until it exits, `None` otherwise.
 
 #### `sandbox.is_running -> bool`
 

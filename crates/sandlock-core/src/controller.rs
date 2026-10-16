@@ -10,6 +10,7 @@ pub struct Controller {
     pub(crate) groups: Arc<crate::pgroup::ProcessGroups>,
     pub(crate) stop: tokio_util::sync::CancellationToken,
     pub(crate) main_exit: tokio::sync::watch::Receiver<Option<ExitStatus>>,
+    pub(crate) pid: i32,
 }
 
 impl Controller {
@@ -32,6 +33,11 @@ impl Controller {
 
     pub fn main_exited(&self) -> bool {
         self.main_exit.borrow().is_some()
+    }
+
+    /// Main's pid until it exits; afterwards the number may name another process.
+    pub fn pid(&self) -> Option<i32> {
+        (!self.main_exited()).then_some(self.pid)
     }
 
     /// Signal every group, returning how many had members left.
