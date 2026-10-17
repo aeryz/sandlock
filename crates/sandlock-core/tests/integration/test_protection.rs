@@ -9,15 +9,9 @@
 //! genuinely confined child to cover the end-to-end degrade path on a
 //! real low-ABI kernel; it self-skips where Landlock is unavailable.
 
-use sandlock_core::landlock::compute_fs_mask;
+use landlock::AccessFs;
+use sandlock_core::landlock_policy::compute_fs_mask;
 use sandlock_core::{Protection, ProtectionPolicy, ProtectionState, ProtectionStatus};
-
-// Landlock FS access constants (kernel ABI, stable). Kept local to the
-// test so we don't need to expose `crate::sys::structs`. These are bit
-// positions defined by `linux/landlock.h`.
-const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
-const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
-const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
 
 // ----------------------------------------------------------------------
 // ProtectionStatus::resolve() — Strict
@@ -190,8 +184,8 @@ fn fully_degradable_policy_never_returns_strictly_unavailable_even_on_v1() {
 #[test]
 fn degradable_fs_truncate_on_v1_host_masks_off_truncate_bit() {
     // FsTruncate needs ABI v3; host claims v1. Marking it Degradable
-    // must drop LANDLOCK_ACCESS_FS_TRUNCATE from the handled-fs mask
-    // (it shouldn't be there from base_fs_access(1) either, but we
+    // must drop AccessFs::Truncate from the handled-fs mask
+    // (it shouldn't be there from base_fs_access(landlock::ABI::V1) either, but we
     // assert the post-mask invariant directly).
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::FsTruncate, ProtectionState::Degradable);
@@ -201,10 +195,9 @@ fn degradable_fs_truncate_on_v1_host_masks_off_truncate_bit() {
         ProtectionStatus::Degraded
     );
     let mask = compute_fs_mask(1, &pol);
-    assert_eq!(
-        mask & LANDLOCK_ACCESS_FS_TRUNCATE,
-        0,
-        "Degraded FsTruncate must not leave its bit in handled_access_fs (mask=0x{:x})",
+    assert!(
+        mask & AccessFs::Truncate as u64 == 0,
+        "Degraded FsTruncate must not leave its bit in handled_access_fs (mask={:?})",
         mask
     );
 }
@@ -212,7 +205,7 @@ fn degradable_fs_truncate_on_v1_host_masks_off_truncate_bit() {
 #[test]
 fn degradable_fs_refer_on_v1_host_masks_off_refer_bit() {
     // FsRefer needs ABI v2; host claims v1. Marking it Degradable
-    // must drop LANDLOCK_ACCESS_FS_REFER from the handled-fs mask.
+    // must drop AccessFs::Refer from the handled-fs mask.
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::FsRefer, ProtectionState::Degradable);
     assert_eq!(
@@ -220,10 +213,9 @@ fn degradable_fs_refer_on_v1_host_masks_off_refer_bit() {
         ProtectionStatus::Degraded
     );
     let mask = compute_fs_mask(1, &pol);
-    assert_eq!(
-        mask & LANDLOCK_ACCESS_FS_REFER,
-        0,
-        "Degraded FsRefer must not leave its bit in handled_access_fs (mask=0x{:x})",
+    assert!(
+        mask & AccessFs::Refer as u64 == 0,
+        "Degraded FsRefer must not leave its bit in handled_access_fs (mask={:?})",
         mask
     );
 }
@@ -231,7 +223,7 @@ fn degradable_fs_refer_on_v1_host_masks_off_refer_bit() {
 #[test]
 fn degradable_fs_ioctl_dev_on_v4_host_masks_off_ioctl_dev_bit() {
     // FsIoctlDev needs ABI v5; host claims v4. Marking it Degradable
-    // must drop LANDLOCK_ACCESS_FS_IOCTL_DEV from the handled-fs mask.
+    // must drop AccessFs::IoctlDev from the handled-fs mask.
     let mut pol = ProtectionPolicy::strict_all();
     pol.set(Protection::FsIoctlDev, ProtectionState::Degradable);
     assert_eq!(
@@ -239,10 +231,9 @@ fn degradable_fs_ioctl_dev_on_v4_host_masks_off_ioctl_dev_bit() {
         ProtectionStatus::Degraded
     );
     let mask = compute_fs_mask(4, &pol);
-    assert_eq!(
-        mask & LANDLOCK_ACCESS_FS_IOCTL_DEV,
-        0,
-        "Degraded FsIoctlDev must not leave its bit in handled_access_fs (mask=0x{:x})",
+    assert!(
+        mask & AccessFs::IoctlDev as u64 == 0,
+        "Degraded FsIoctlDev must not leave its bit in handled_access_fs (mask={:?})",
         mask
     );
 }
@@ -410,7 +401,7 @@ fn confine_filesystem_succeeds_in_child(sandbox: &sandlock_core::Sandbox) -> i32
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             unsafe { libc::_exit(2) };
         }
-        let code = match sandlock_core::landlock::confine_filesystem(sandbox) {
+        let code = match sandlock_core::landlock_policy::confine_filesystem(sandbox) {
             Ok(()) => 0,
             Err(_) => 1,
         };
@@ -427,7 +418,7 @@ fn disable_fs_protection_with_writable_path_does_not_einval() {
     // Needs a real v6+ host: the default policy keeps the v6 scope
     // protections Strict, so confine_filesystem would otherwise abort
     // with ProtectionUnavailable before reaching the FS rules.
-    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 {
+    if sandlock_core::landlock_abi_version().unwrap_or(0) < 6 as u32 {
         eprintln!("Skipping: Landlock ABI v6 required");
         return;
     }

@@ -1,94 +1,20 @@
-use std::os::fd::OwnedFd;
+use std::ffi::CString;
+use std::fs::File;
+use std::io;
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+
+use landlock::{
+    AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, NetPort, PathBeneath, Ruleset,
+    RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus, Scope,
+};
 
 use crate::error::{ConfinementError, SandlockError};
 use crate::protection::{Protection, ProtectionPolicy, ProtectionStatus};
 use crate::sandbox::Sandbox;
-use crate::sys::structs::{
-    LandlockNetPortAttr, LandlockPathBeneathAttr, LandlockRulesetAttr, LANDLOCK_ACCESS_FS_EXECUTE,
-    LANDLOCK_ACCESS_FS_IOCTL_DEV, LANDLOCK_ACCESS_FS_MAKE_BLOCK, LANDLOCK_ACCESS_FS_MAKE_CHAR,
-    LANDLOCK_ACCESS_FS_MAKE_DIR, LANDLOCK_ACCESS_FS_MAKE_FIFO, LANDLOCK_ACCESS_FS_MAKE_REG,
-    LANDLOCK_ACCESS_FS_MAKE_SOCK, LANDLOCK_ACCESS_FS_MAKE_SYM, LANDLOCK_ACCESS_FS_READ_DIR,
-    LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REMOVE_DIR,
-    LANDLOCK_ACCESS_FS_REMOVE_FILE, LANDLOCK_ACCESS_FS_TRUNCATE, LANDLOCK_ACCESS_FS_WRITE_FILE,
-    LANDLOCK_ACCESS_NET_BIND_TCP, LANDLOCK_ACCESS_NET_CONNECT_TCP, LANDLOCK_CREATE_RULESET_VERSION,
-    LANDLOCK_RULE_NET_PORT, LANDLOCK_RULE_PATH_BENEATH, LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
-    LANDLOCK_SCOPE_SIGNAL, SYS_LANDLOCK_CREATE_RULESET,
-};
+use crate::sys::structs::{LANDLOCK_CREATE_RULESET_VERSION, SYS_LANDLOCK_CREATE_RULESET};
 use crate::sys::syscall;
-
-// ============================================================
-// Access flag helpers
-// ============================================================
-
-/// All FS read access flags.
-const READ_ACCESS: u64 =
-    LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-
-/// Access rights that apply to non-directory files. The kernel rejects a
-/// path-beneath rule on a non-directory whose `allowed_access` carries any
-/// directory-only right (READ_DIR, MAKE_*, REMOVE_*, REFER) with EINVAL, so the
-/// requested access is masked down to this set for files and device nodes.
-const ACCESS_FILE: u64 = LANDLOCK_ACCESS_FS_EXECUTE
-    | LANDLOCK_ACCESS_FS_WRITE_FILE
-    | LANDLOCK_ACCESS_FS_READ_FILE
-    | LANDLOCK_ACCESS_FS_TRUNCATE
-    | LANDLOCK_ACCESS_FS_IOCTL_DEV;
-
-/// Build the full FS access bitmask for the given ABI version.
-fn base_fs_access(abi: u32) -> u64 {
-    // ABI v1 base: bits 0-12 (EXECUTE through MAKE_SYM)
-    let mut mask: u64 = LANDLOCK_ACCESS_FS_EXECUTE
-        | LANDLOCK_ACCESS_FS_WRITE_FILE
-        | LANDLOCK_ACCESS_FS_READ_FILE
-        | LANDLOCK_ACCESS_FS_READ_DIR
-        | LANDLOCK_ACCESS_FS_REMOVE_DIR
-        | LANDLOCK_ACCESS_FS_REMOVE_FILE
-        | LANDLOCK_ACCESS_FS_MAKE_CHAR
-        | LANDLOCK_ACCESS_FS_MAKE_DIR
-        | LANDLOCK_ACCESS_FS_MAKE_REG
-        | LANDLOCK_ACCESS_FS_MAKE_SOCK
-        | LANDLOCK_ACCESS_FS_MAKE_FIFO
-        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
-        | LANDLOCK_ACCESS_FS_MAKE_SYM;
-
-    if abi >= 2 {
-        mask |= LANDLOCK_ACCESS_FS_REFER;
-    }
-    if abi >= 3 {
-        mask |= LANDLOCK_ACCESS_FS_TRUNCATE;
-    }
-    if abi >= 5 {
-        mask |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
-    }
-    mask
-}
-
-/// Build the write access bitmask: READ_ACCESS + all write/create/delete flags.
-fn write_access(abi: u32) -> u64 {
-    let mut mask: u64 = READ_ACCESS
-        | LANDLOCK_ACCESS_FS_WRITE_FILE
-        | LANDLOCK_ACCESS_FS_REMOVE_DIR
-        | LANDLOCK_ACCESS_FS_REMOVE_FILE
-        | LANDLOCK_ACCESS_FS_MAKE_CHAR
-        | LANDLOCK_ACCESS_FS_MAKE_DIR
-        | LANDLOCK_ACCESS_FS_MAKE_REG
-        | LANDLOCK_ACCESS_FS_MAKE_SOCK
-        | LANDLOCK_ACCESS_FS_MAKE_FIFO
-        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
-        | LANDLOCK_ACCESS_FS_MAKE_SYM;
-
-    if abi >= 2 {
-        mask |= LANDLOCK_ACCESS_FS_REFER;
-    }
-    if abi >= 3 {
-        mask |= LANDLOCK_ACCESS_FS_TRUNCATE;
-    }
-    if abi >= 5 {
-        mask |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
-    }
-    mask
-}
 
 /// Indices N for which `/dev/nvidiaN` exists. Used for the "all GPUs"
 /// (`gpu_devices == []`) case. Matches `nvidia<digits>` exactly, so the
@@ -166,10 +92,10 @@ fn shadowed_files() -> impl Iterator<Item = &'static Path> {
 /// in `dir` after this is not covered; the grants this applies to are
 /// read-only host trees such as /etc.
 fn add_read_rules_around_shadowed(
-    ruleset_fd: &OwnedFd,
+    mut ruleset: RulesetCreated,
     dir: &Path,
-) -> Result<(), ConfinementError> {
-    add_path_rule(ruleset_fd, dir, LANDLOCK_ACCESS_FS_READ_DIR)?;
+) -> Result<RulesetCreated, ConfinementError> {
+    ruleset = add_path_beneath_rule(ruleset, dir, AccessFs::ReadDir)?;
     let entries = std::fs::read_dir(dir)
         .map_err(|e| ConfinementError::Landlock(format!("read dir {:?}: {}", dir, e)))?;
     for entry in entries.flatten() {
@@ -182,77 +108,14 @@ fn add_read_rules_around_shadowed(
             continue;
         }
         if shadowed_files().any(|f| f.starts_with(&path)) {
-            add_read_rules_around_shadowed(ruleset_fd, &path)?;
+            ruleset = add_read_rules_around_shadowed(ruleset, &path)?;
         } else {
             // An entry that vanished or cannot be referenced costs only itself.
-            let _ = add_path_rule(ruleset_fd, &path, READ_ACCESS);
+            let _ =
+                add_path_beneath_rule(&mut ruleset, path, AccessFs::from_read(landlock::ABI::V1));
         }
     }
-    Ok(())
-}
-
-/// Open `path` and add a Landlock path-beneath rule to `ruleset_fd`.
-fn add_path_rule(ruleset_fd: &OwnedFd, path: &Path, access: u64) -> Result<(), ConfinementError> {
-    use std::os::fd::FromRawFd;
-    // Reference the path with O_PATH rather than opening it for I/O: O_PATH does
-    // not block on FIFOs and needs no read permission on the target, so a rule
-    // on a FIFO or a write-only/no-read path neither hangs nor fails here. An
-    // O_PATH fd still supports fstat (the file-type check below) and serves as a
-    // valid parent_fd for landlock_add_rule. Call open(2) directly: musl folds
-    // O_PATH into O_ACCMODE, which OpenOptions::custom_flags masks out.
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|e| ConfinementError::Landlock(format!("open path {:?} failed: {}", path, e)))?;
-    let raw = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-    if raw < 0 {
-        let e = std::io::Error::last_os_error();
-        return Err(ConfinementError::Landlock(format!(
-            "open path {:?} failed: {}",
-            path, e
-        )));
-    }
-    let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(raw) });
-
-    // Directory-only access rights (READ_DIR, MAKE_*, REMOVE_*, REFER) make
-    // landlock_add_rule fail with EINVAL on a non-directory path. Mask the
-    // requested access down to the file-applicable set for files and devices.
-    let allowed_access = match file.metadata() {
-        Ok(m) if m.is_dir() => access,
-        _ => access & ACCESS_FILE,
-    };
-
-    use std::os::unix::io::AsRawFd;
-    let attr = LandlockPathBeneathAttr {
-        allowed_access,
-        parent_fd: file.as_raw_fd(),
-    };
-
-    syscall::landlock_add_rule(
-        ruleset_fd,
-        LANDLOCK_RULE_PATH_BENEATH,
-        &attr as *const _ as *const std::ffi::c_void,
-        0,
-    )
-    .map_err(|e| ConfinementError::Landlock(format!("add path rule for {:?}: {}", path, e)))?;
-
-    Ok(())
-}
-
-/// Add a Landlock network port rule to `ruleset_fd`.
-fn add_net_rule(ruleset_fd: &OwnedFd, port: u16, access: u64) -> Result<(), ConfinementError> {
-    let attr = LandlockNetPortAttr {
-        allowed_access: access,
-        port: port as u64,
-    };
-
-    syscall::landlock_add_rule(
-        ruleset_fd,
-        LANDLOCK_RULE_NET_PORT,
-        &attr as *const _ as *const std::ffi::c_void,
-        0,
-    )
-    .map_err(|e| ConfinementError::Landlock(format!("add net rule for port {}: {}", port, e)))?;
-
-    Ok(())
+    Ok(ruleset)
 }
 
 // ============================================================
@@ -275,7 +138,7 @@ fn add_net_rule(ruleset_fd: &OwnedFd, port: u16, access: u64) -> Result<(), Conf
 ///
 /// In test builds a `debug_assert!` pins the invariant so a future
 /// caller that forgets the upstream guard fails loudly.
-pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
+pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> BitFlags<Scope> {
     debug_assert!(
         !matches!(
             ProtectionStatus::resolve(Protection::SignalScope, abi, pol),
@@ -293,54 +156,69 @@ pub(crate) fn compute_scope_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
          caller must filter via confine_inner's Protection::all() walk first"
     );
 
-    let mut mask: u64 = 0;
+    let mut mask: BitFlags<Scope> = Default::default();
     // This scope is also what keeps the confined child, which shares the
     // supervisor's uid, off the supervisor's abstract control socket.
     if ProtectionStatus::resolve(Protection::AbstractUnixSocketScope, abi, pol)
         == ProtectionStatus::Active
     {
-        mask |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
+        mask |= Scope::AbstractUnixSocket;
     }
     if ProtectionStatus::resolve(Protection::SignalScope, abi, pol) == ProtectionStatus::Active {
-        mask |= LANDLOCK_SCOPE_SIGNAL;
+        mask |= Scope::Signal;
     }
     mask
 }
 
-/// Compute the `handled_access_fs` mask. Starts from the ABI-cumulative
-/// base set and masks off bits whose corresponding `Protection` is
-/// `Disabled` or `Degraded` in the policy.
-///
-/// `Degraded` means a `Degradable` protection on a host that does not
-/// provide the underlying kernel hook — declaring the bit anyway would
-/// fail `landlock_create_ruleset` with EINVAL and break the silent-skip
-/// contract. `base_fs_access(abi)` already gates each extension bit on
-/// the host ABI, so on a real host the `Degraded` bit is not in the
-/// base mask in the first place. Masking it off here is defence in
-/// depth: the contract is uniformly expressed regardless of how
-/// `base_fs_access` evolves, and the synthetic-ABI integration tests
-/// can exercise this code path directly.
+/// Compute the raw `handled_access_fs` mask, excluding disabled or degraded
+/// protections. Returns kernel access bits without exposing crate-specific types.
 pub fn compute_fs_mask(abi: u32, pol: &ProtectionPolicy) -> u64 {
-    let mut mask = base_fs_access(abi);
+    if abi == 0 {
+        return 0;
+    }
+    // Only explicitly supported rights are handled so that `landlock` dependency updates
+    // do not silently widen the ruleset.
+    let mut mask = AccessFs::Execute
+        | AccessFs::WriteFile
+        | AccessFs::ReadFile
+        | AccessFs::ReadDir
+        | AccessFs::RemoveDir
+        | AccessFs::RemoveFile
+        | AccessFs::MakeChar
+        | AccessFs::MakeDir
+        | AccessFs::MakeReg
+        | AccessFs::MakeSock
+        | AccessFs::MakeFifo
+        | AccessFs::MakeBlock
+        | AccessFs::MakeSym;
+    if abi >= 2 {
+        mask |= AccessFs::Refer;
+    }
+    if abi >= 3 {
+        mask |= AccessFs::Truncate;
+    }
+    if abi >= 5 {
+        mask |= AccessFs::IoctlDev;
+    }
     if matches!(
         ProtectionStatus::resolve(Protection::FsRefer, abi, pol),
         ProtectionStatus::Disabled | ProtectionStatus::Degraded
     ) {
-        mask &= !LANDLOCK_ACCESS_FS_REFER;
+        mask &= !AccessFs::Refer;
     }
     if matches!(
         ProtectionStatus::resolve(Protection::FsTruncate, abi, pol),
         ProtectionStatus::Disabled | ProtectionStatus::Degraded
     ) {
-        mask &= !LANDLOCK_ACCESS_FS_TRUNCATE;
+        mask &= !AccessFs::Truncate;
     }
     if matches!(
         ProtectionStatus::resolve(Protection::FsIoctlDev, abi, pol),
         ProtectionStatus::Disabled | ProtectionStatus::Degraded
     ) {
-        mask &= !LANDLOCK_ACCESS_FS_IOCTL_DEV;
+        mask &= !AccessFs::IoctlDev;
     }
-    mask
+    mask.bits()
 }
 
 /// Compute the `handled_access_net` mask AND the TCP wildcard flag,
@@ -373,10 +251,10 @@ pub fn compute_net_mask(
     handle_net: bool,
 ) -> (u64, bool) {
     if !handle_net {
-        return (0, false);
+        return (Default::default(), false);
     }
     if ProtectionStatus::resolve(Protection::NetTcp, abi, pol) != ProtectionStatus::Active {
-        return (0, false);
+        return (Default::default(), false);
     }
     use crate::sandbox::Protocol;
     let allow_all_ports = sandbox
@@ -385,11 +263,11 @@ pub fn compute_net_mask(
         .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
     let deny_only = !sandbox.net_deny.is_empty() && !sandbox.net_allow_is_active();
     let net_wildcard = deny_only || allow_all_ports;
-    let mut mask = if net_wildcard {
-        LANDLOCK_ACCESS_NET_BIND_TCP
-    } else {
-        LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP
-    };
+    let mut mask = AccessNet::BindTcp | AccessNet::ConnectTcp;
+
+    if net_wildcard {
+        mask &= !AccessNet::ConnectTcp;
+    }
     // `--net-deny-bind` is default-allow: every TCP bind must reach the
     // on-behalf seccomp handler (the bind denylist enforcer), so Landlock
     // must not gate BIND_TCP. Drop it from the handled set; the on-behalf
@@ -401,9 +279,9 @@ pub fn compute_net_mask(
     // with port 0 permits only a `bind(0)` request (the kernel then chooses
     // an ephemeral port) and does not permit explicit `bind(nonzero)`.
     if !sandbox.net_deny_bind.is_empty() || sandbox.net_allow_bind.is_all() {
-        mask &= !LANDLOCK_ACCESS_NET_BIND_TCP;
+        mask &= !AccessNet::BindTcp;
     }
-    (mask, net_wildcard)
+    (mask.bits(), net_wildcard)
 }
 
 // ============================================================
@@ -421,6 +299,12 @@ pub const MIN_ABI: u32 = 6;
 ///
 /// Requires Landlock ABI v6 or later. Returns an error if the kernel does
 /// not meet this requirement.
+///
+/// # Prerequisites
+///
+/// The caller must set `PR_SET_NO_NEW_PRIVS` with `prctl(2)` before calling
+/// this function. This function does not set it. Without it, Landlock
+/// enforcement requires `CAP_SYS_ADMIN` in the current user namespace.
 pub fn confine(policy: &Sandbox) -> Result<(), SandlockError> {
     confine_inner(policy, true, false)
 }
@@ -431,6 +315,12 @@ pub(crate) fn confine_supervised(policy: &Sandbox) -> Result<(), SandlockError> 
 }
 
 /// Apply Landlock filesystem confinement without TCP bind/connect rules.
+///
+/// # Prerequisites
+///
+/// The caller must set `PR_SET_NO_NEW_PRIVS` with `prctl(2)` before calling
+/// this function. This function does not set it. Without it, Landlock
+/// enforcement requires `CAP_SYS_ADMIN` in the current user namespace.
 pub fn confine_filesystem(policy: &Sandbox) -> Result<(), SandlockError> {
     confine_inner(policy, false, false)
 }
@@ -440,9 +330,10 @@ fn confine_inner(
     handle_net: bool,
     supervised: bool,
 ) -> Result<(), SandlockError> {
+    let ruleset_error = |e: landlock::RulesetError| ConfinementError::Landlock(e.to_string());
+
     // Step 1 — detect host ABI version.
-    let abi = abi_version()
-        .map_err(|e| SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e)))?;
+    let abi = abi_version()?;
 
     // Step 2 — per-protection availability resolution. Any protection
     // in `ProtectionState::Strict` that the host kernel cannot provide
@@ -454,15 +345,12 @@ fn confine_inner(
     let pol = &policy.protection_policy;
     for protection in Protection::all() {
         if ProtectionStatus::resolve(protection, abi, pol) == ProtectionStatus::Unavailable {
-            return Err(SandlockError::Runtime(
-                crate::error::SandboxRuntimeError::Confinement(
-                    ConfinementError::ProtectionUnavailable {
-                        protection,
-                        required_abi: protection.min_abi(),
-                        host_abi: abi,
-                    },
-                ),
-            ));
+            return Err(ConfinementError::ProtectionUnavailable {
+                protection,
+                required_abi: protection.min_abi(),
+                host_abi: abi,
+            }
+            .into());
         }
     }
 
@@ -470,7 +358,8 @@ fn confine_inner(
     //
     // FS: cumulative ABI base set, with `Disabled` protections masked
     // off (FsRefer/FsTruncate/FsIoctlDev).
-    let handled_access_fs = compute_fs_mask(abi, pol);
+    let handled_access_fs = BitFlags::<AccessFs>::from_bits(compute_fs_mask(abi, pol))
+        .expect("known filesystem rights");
 
     // Net: TCP bind/connect via Landlock by default. When any
     // `--net-allow` rule has the all-ports wildcard (`host:*` or
@@ -493,25 +382,35 @@ fn confine_inner(
     // derived from, so the two cannot diverge.
     use crate::sandbox::Protocol;
     let (handled_access_net, net_wildcard) = compute_net_mask(abi, pol, policy, handle_net);
+    let handled_access_net =
+        BitFlags::<AccessNet>::from_bits(handled_access_net).expect("known network rights");
 
     // Scope: IPC + signal isolation, each gated on its protection's
     // resolved state.
     let scoped = compute_scope_mask(abi, pol);
 
     // Step 3 — create ruleset.
-    let attr = LandlockRulesetAttr {
-        handled_access_fs,
-        handled_access_net,
-        scoped,
-    };
+    // Sandlock enforces and degrades the rules already. We don't want the crate to silently
+    // drop our requirements by using the default `BestEffort.`
+    let mut ruleset = Ruleset::default().set_compatibility(CompatLevel::HardRequirement);
 
-    let ruleset_fd =
-        syscall::landlock_create_ruleset(&attr, std::mem::size_of::<LandlockRulesetAttr>(), 0)
-            .map_err(|e| {
-                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
-                    ConfinementError::Landlock(format!("create ruleset: {}", e)),
-                ))
-            })?;
+    if !handled_access_fs.is_empty() {
+        ruleset = ruleset
+            .handle_access(handled_access_fs)
+            .map_err(ruleset_error)?;
+    }
+
+    if !handled_access_net.is_empty() {
+        ruleset = ruleset
+            .handle_access(handled_access_net)
+            .map_err(ruleset_error)?;
+    }
+
+    if !scoped.is_empty() {
+        ruleset = ruleset.scope(scoped).map_err(ruleset_error)?;
+    }
+
+    let mut ruleset = ruleset.create().map_err(ruleset_error)?;
 
     // Step 4 — add filesystem path rules.
     // When chroot is active, translate virtual paths (inside chroot) to host
@@ -521,15 +420,10 @@ fn confine_inner(
     // The PT_INTERP patching in handle_chroot_exec ensures the kernel loads
     // the image's ELF interpreter via an injected fd, not a host path.
     let chroot_root = policy.chroot.as_deref();
-    // Intersect the per-path write mask with the resolved handled set so
-    // every installed rule is a subset of `handled_access_fs` by
-    // construction. `compute_fs_mask` drops the REFER/TRUNCATE/IOCTL_DEV
-    // bit for any FS protection that is Disabled or Degraded; without this
-    // intersection the writable-path rule would still request the dropped
-    // bit and `landlock_add_rule` would reject it with EINVAL. (The file
-    // path inside `add_path_rule` further narrows this with `& ACCESS_FILE`,
-    // which preserves the subset property.)
-    let fs_write_mask = write_access(abi) & handled_access_fs;
+    // Use the resolved handled set for writable-path grants so disabled or
+    // degraded rights cannot be reintroduced. path_beneath_rule further
+    // removes directory-only rights for non-directory paths.
+    let fs_write_mask = handled_access_fs;
     for path in &policy.fs_writable {
         if supervised && chroot_root.is_none() && crate::procfs::is_supervised_proc_grant(path) {
             continue;
@@ -544,9 +438,8 @@ fn confine_inner(
         } else {
             path.as_path()
         };
-        add_path_rule(&ruleset_fd, rule_path, fs_write_mask).map_err(|e| {
-            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
-        })?;
+
+        ruleset = add_path_beneath_rule(ruleset, rule_path, fs_write_mask)?;
     }
 
     for path in &policy.fs_readable {
@@ -568,16 +461,14 @@ fn confine_inner(
                 continue;
             }
             if supervised && shadowed_files().any(|f| f.starts_with(path)) {
-                add_read_rules_around_shadowed(&ruleset_fd, path).map_err(|e| {
-                    SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
-                })?;
+                ruleset = add_read_rules_around_shadowed(ruleset, path)?;
                 continue;
             }
             path.as_path()
         };
-        add_path_rule(&ruleset_fd, rule_path, READ_ACCESS).map_err(|e| {
-            SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
-        })?;
+
+        ruleset =
+            add_path_beneath_rule(ruleset, rule_path, AccessFs::from_read(landlock::ABI::V1))?;
     }
 
     // GPU device paths (when gpu_devices is set)
@@ -585,8 +476,8 @@ fn confine_inner(
         // Shared control nodes: required for ANY GPU use, not per-GPU.
         // (nvidiactl = RM control channel; uvm = unified memory.)
         for path in &["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools"] {
-            let _ = add_path_rule(&ruleset_fd, Path::new(path), fs_write_mask);
             // Ignore errors — nodes may not exist (e.g. uvm before first use)
+            let _ = add_path_beneath_rule(&mut ruleset, path, fs_write_mask);
         }
 
         // Per-GPU render nodes. Each physical GPU N is a distinct node
@@ -601,7 +492,7 @@ fn confine_inner(
         };
         for idx in indices {
             let node = format!("/dev/nvidia{idx}");
-            let _ = add_path_rule(&ruleset_fd, Path::new(&node), fs_write_mask);
+            let _ = add_path_beneath_rule(&mut ruleset, node, fs_write_mask);
         }
 
         // DRM render nodes. /dev/dri is a directory of per-GPU card*/renderD*
@@ -610,16 +501,17 @@ fn confine_inner(
         // /dev/dri, so only grant it for the all-GPUs case; per-index DRM
         // mapping would need a PCI-BDF -> renderD* lookup (future work).
         if devices.is_empty() {
-            let _ = add_path_rule(&ruleset_fd, Path::new("/dev/dri"), fs_write_mask);
+            let _ = add_path_beneath_rule(&mut ruleset, "/dev/dri", fs_write_mask);
         }
 
         // Read-only access to GPU sysfs/procfs
+        let fs_read_mask = AccessFs::from_read((abi as i32).into());
         for path in &[
             "/proc/driver/nvidia",
             "/sys/bus/pci/devices",
             "/sys/module/nvidia",
         ] {
-            let _ = add_path_rule(&ruleset_fd, Path::new(path), READ_ACCESS);
+            let _ = add_path_beneath_rule(&mut ruleset, path, fs_read_mask);
         }
     }
 
@@ -628,17 +520,15 @@ fn confine_inner(
     // degraded on a host without TCP network hooks) — `handled_access_net`
     // is 0 in that case and the kernel would reject any rule with EINVAL.
     let net_tcp_active =
-        ProtectionStatus::resolve(Protection::NetTcp, abi, pol) == ProtectionStatus::Active;
+        ProtectionStatus::resolve(Protection::NetTcp, abi as u32, pol) == ProtectionStatus::Active;
     // `BindPorts::All` installs no rules: BIND_TCP was dropped from the
     // handled set, so every bind is already allowed. A listed port `0` is
     // installed verbatim: Landlock permits only a `bind(0)` request with it
     // (the kernel then chooses an ephemeral port), not explicit nonzero binds.
-    if handle_net && net_tcp_active && handled_access_net & LANDLOCK_ACCESS_NET_BIND_TCP != 0 {
+    if handle_net && net_tcp_active && handled_access_net.contains(AccessNet::BindTcp) {
         if let crate::sandbox::BindPorts::Ports(ports) = &policy.net_allow_bind {
             for &port in ports {
-                add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_BIND_TCP).map_err(|e| {
-                    SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
-                })?;
+                ruleset = add_net_rule(ruleset, port, AccessNet::BindTcp)?;
             }
         }
     }
@@ -670,20 +560,87 @@ fn confine_inner(
             connect_ports.insert(p);
         }
         for port in connect_ports {
-            add_net_rule(&ruleset_fd, port, LANDLOCK_ACCESS_NET_CONNECT_TCP).map_err(|e| {
-                SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(e))
-            })?;
+            ruleset = add_net_rule(ruleset, port, AccessNet::ConnectTcp)?;
         }
     }
 
     // Step 6 — enforce (irreversible).
-    syscall::landlock_restrict_self(&ruleset_fd, 0).map_err(|e| {
-        SandlockError::Runtime(crate::error::SandboxRuntimeError::Confinement(
-            ConfinementError::Landlock(format!("restrict_self: {}", e)),
-        ))
-    })?;
+    enforce_ruleset(ruleset)?;
+    Ok(())
+}
+
+fn enforce_ruleset(ruleset: RulesetCreated) -> Result<(), ConfinementError> {
+    // The callers already set `PR_SET_NO_NEW_PRIVS`. We don't need to do that again in the
+    // crate.
+    let status = ruleset
+        .no_new_privs(false)
+        .restrict_self()
+        .map_err(|e| ConfinementError::Landlock(e.to_string()))?;
+    // Under HardRequirement, compatibility failures permanently set the crate's
+    // state to Dummy. Later add_rule/scope/restrict_self calls can then return Ok
+    // without syscalls. Since optional path grants ignore errors, this guard is
+    // load-bearing: NotEnforced must fail closed, not silently remove confinement.
+    if status.ruleset != RulesetStatus::FullyEnforced {
+        return Err(ConfinementError::Landlock(format!(
+            "ruleset was not fully enforced: {:?}",
+            status.ruleset
+        )));
+    }
 
     Ok(())
+}
+
+/// Helper for wrapping the error with the given port and the rule.
+/// Use this instead of `landlock`'s `add_rule` to have a better error message.
+fn add_net_rule<R: RulesetCreatedAttr>(
+    ruleset: R,
+    port: u16,
+    rule: AccessNet,
+) -> Result<R, ConfinementError> {
+    ruleset
+        .add_rule(NetPort::new(port, rule))
+        .map_err(|e| ConfinementError::Landlock(format!("add net rule for port {}: {}", port, e)))
+}
+
+/// Helper for adding a path-beneath rule.
+/// Prefer this instead of using `landlock::PathBeneath` directly since this one
+/// contains an important fix and it wraps the error with the given path and rule.
+fn add_path_beneath_rule<R, P, A>(ruleset: R, path: P, access: A) -> Result<R, ConfinementError>
+where
+    R: RulesetCreatedAttr,
+    P: AsRef<Path>,
+    A: Into<BitFlags<AccessFs>>,
+{
+    let fail = |e| ConfinementError::Landlock(format!("open path {:?}: {}", path.as_ref(), e));
+
+    let c_path = CString::new(path.as_ref().as_os_str().as_bytes())
+        .map_err(|e| fail(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
+
+    // Open directly: OpenOptions masks out O_PATH on musl.
+    // See: https://github.com/rust-lang/rust/issues/164464
+    // SAFETY: `c_path` is a valid, NUL-terminated string.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(fail(io::Error::last_os_error()));
+    }
+
+    // SAFETY: `open` returned a fresh descriptor. File takes sole ownership.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(fail)?;
+
+    let mut access = access.into();
+    if !metadata.is_dir() {
+        // Directory-only rights are invalid on files/device nodes.
+        // V9 is the highest ABI supported by landlock 0.4.7. This
+        // filters file-applicable rights, not host ABI availability.
+        access &= AccessFs::from_file(landlock::ABI::V9);
+    }
+
+    ruleset
+        .add_rule(PathBeneath::new(file, access))
+        .map_err(|e| {
+            ConfinementError::Landlock(format!("add path rule for {:?}: {}", path.as_ref(), e))
+        })
 }
 
 // ============================================================
@@ -692,7 +649,7 @@ fn confine_inner(
 //
 // These tests check the *observable* output bits of
 // `compute_scope_mask` / `compute_fs_mask` / `compute_net_mask` against
-// the Landlock kernel constants, not just that the policy-state
+// the Landlock crate's access flags, not just that the policy-state
 // HashMap was mutated. Each `ProtectionState` combined with each host
 // ABI produces a specific bit pattern — these tests are the contract
 // pin for the Landlock attrs that exit `confine_inner`. Drift here is
@@ -700,9 +657,45 @@ fn confine_inner(
 
 #[cfg(test)]
 mod mask_contract_tests {
+
     use super::*;
     use crate::protection::ProtectionState;
     use crate::Sandbox;
+
+    #[test]
+    fn ignored_compatibility_failure_must_not_disable_confinement() {
+        let mut ruleset = Ruleset::default()
+            .handle_access(AccessFs::ReadFile | AccessFs::ReadDir)
+            .unwrap()
+            .create()
+            .unwrap()
+            .set_compatibility(CompatLevel::HardRequirement);
+        let file = tempfile::tempfile().unwrap();
+
+        // A directory-only right on a regular file fails compatibility and
+        // permanently poisons the ruleset, even though the error is ignored.
+        assert!((&mut ruleset)
+            .add_rule(PathBeneath::new(&file, AccessFs::ReadDir))
+            .is_err());
+        // Subsequent valid grants can misleadingly succeed in Dummy state.
+        (&mut ruleset)
+            .add_rule(PathBeneath::new(&file, AccessFs::ReadFile))
+            .unwrap();
+
+        // Dummy restrict_self performs no confinement syscall. Sandlock must
+        // reject its successful-but-NotEnforced result, not return success.
+        let status = ruleset
+            .try_clone()
+            .unwrap()
+            .no_new_privs(false)
+            .restrict_self()
+            .unwrap();
+        assert_eq!(status.ruleset, RulesetStatus::NotEnforced);
+        assert!(matches!(
+            enforce_ruleset(ruleset),
+            Err(ConfinementError::Landlock(_))
+        ));
+    }
 
     // ---------- compute_scope_mask ----------
 
@@ -712,7 +705,7 @@ mod mask_contract_tests {
         let mask = compute_scope_mask(6, &pol);
         assert_eq!(
             mask,
-            LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+            Scope::Signal | Scope::AbstractUnixSocket,
             "strict_all on v6 host must request both v6 IPC scopes"
         );
     }
@@ -722,10 +715,9 @@ mod mask_contract_tests {
         let mut pol = ProtectionPolicy::strict_all();
         pol.set(Protection::SignalScope, ProtectionState::Disabled);
         let mask = compute_scope_mask(6, &pol);
-        assert_eq!(mask & LANDLOCK_SCOPE_SIGNAL, 0, "SIGNAL must be cleared");
-        assert_eq!(
-            mask & LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
-            LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
+        assert!(!mask.contains(Scope::Signal), "SIGNAL must be cleared");
+        assert!(
+            mask.contains(Scope::AbstractUnixSocket),
             "ABSTRACT_UNIX_SOCKET must remain set"
         );
     }
@@ -738,16 +730,11 @@ mod mask_contract_tests {
             ProtectionState::Disabled,
         );
         let mask = compute_scope_mask(6, &pol);
-        assert_eq!(
-            mask & LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET,
-            0,
+        assert!(
+            !mask.contains(Scope::AbstractUnixSocket),
             "ABSTRACT_UNIX_SOCKET must be cleared",
         );
-        assert_eq!(
-            mask & LANDLOCK_SCOPE_SIGNAL,
-            LANDLOCK_SCOPE_SIGNAL,
-            "SIGNAL must remain set",
-        );
+        assert!(mask.contains(Scope::Signal), "SIGNAL must remain set",);
     }
 
     #[test]
@@ -758,9 +745,8 @@ mod mask_contract_tests {
             Protection::AbstractUnixSocketScope,
             ProtectionState::Disabled,
         );
-        assert_eq!(
-            compute_scope_mask(6, &pol),
-            0,
+        assert!(
+            compute_scope_mask(6, &pol).is_empty(),
             "both scopes disabled on a capable host must produce mask=0"
         );
     }
@@ -775,9 +761,8 @@ mod mask_contract_tests {
             Protection::AbstractUnixSocketScope,
             ProtectionState::Degradable,
         );
-        assert_eq!(
-            compute_scope_mask(5, &pol),
-            0,
+        assert!(
+            compute_scope_mask(5, &pol).is_empty(),
             "Degradable scopes on a v5 host must contribute no bits"
         );
     }
@@ -785,17 +770,34 @@ mod mask_contract_tests {
     // ---------- compute_fs_mask ----------
 
     #[test]
+    fn fs_mask_tracks_supported_abi_boundaries_without_future_rights() {
+        let pol = ProtectionPolicy::strict_all();
+        for (abi, expected) in [
+            (0, 0),
+            (1, 0x1fff),
+            (2, 0x3fff),
+            (3, 0x7fff),
+            (4, 0x7fff),
+            (5, 0xffff),
+            (9, 0xffff),
+            (u32::MAX, 0xffff),
+        ] {
+            assert_eq!(compute_fs_mask(abi, &pol), expected, "ABI {abi}");
+        }
+    }
+
+    #[test]
     fn fs_mask_strict_v6_includes_all_fs_protection_bits() {
         let pol = ProtectionPolicy::strict_all();
         let mask = compute_fs_mask(6, &pol);
+        let mask = BitFlags::<AccessFs>::from_bits(mask).unwrap();
         for (bit, name) in [
-            (LANDLOCK_ACCESS_FS_REFER, "REFER"),
-            (LANDLOCK_ACCESS_FS_TRUNCATE, "TRUNCATE"),
-            (LANDLOCK_ACCESS_FS_IOCTL_DEV, "IOCTL_DEV"),
+            (AccessFs::Refer, "REFER"),
+            (AccessFs::Truncate, "TRUNCATE"),
+            (AccessFs::IoctlDev, "IOCTL_DEV"),
         ] {
-            assert_eq!(
-                mask & bit,
-                bit,
+            assert!(
+                mask.contains(bit),
                 "{} bit must be set in the strict v6 fs mask",
                 name,
             );
@@ -807,15 +809,10 @@ mod mask_contract_tests {
         let mut pol = ProtectionPolicy::strict_all();
         pol.set(Protection::FsRefer, ProtectionState::Disabled);
         let mask = compute_fs_mask(6, &pol);
-        assert_eq!(mask & LANDLOCK_ACCESS_FS_REFER, 0);
-        assert_eq!(
-            mask & LANDLOCK_ACCESS_FS_TRUNCATE,
-            LANDLOCK_ACCESS_FS_TRUNCATE
-        );
-        assert_eq!(
-            mask & LANDLOCK_ACCESS_FS_IOCTL_DEV,
-            LANDLOCK_ACCESS_FS_IOCTL_DEV
-        );
+        let mask = BitFlags::<AccessFs>::from_bits(mask).unwrap();
+        assert!(!mask.contains(AccessFs::Refer));
+        assert!(mask.contains(AccessFs::Truncate));
+        assert!(mask.contains(AccessFs::IoctlDev));
     }
 
     #[test]
@@ -823,12 +820,10 @@ mod mask_contract_tests {
         let mut pol = ProtectionPolicy::strict_all();
         pol.set(Protection::FsTruncate, ProtectionState::Disabled);
         let mask = compute_fs_mask(6, &pol);
-        assert_eq!(mask & LANDLOCK_ACCESS_FS_TRUNCATE, 0);
-        assert_eq!(mask & LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REFER);
-        assert_eq!(
-            mask & LANDLOCK_ACCESS_FS_IOCTL_DEV,
-            LANDLOCK_ACCESS_FS_IOCTL_DEV
-        );
+        let mask = BitFlags::<AccessFs>::from_bits(mask).unwrap();
+        assert!(!mask.contains(AccessFs::Truncate));
+        assert!(mask.contains(AccessFs::Refer));
+        assert!(mask.contains(AccessFs::IoctlDev));
     }
 
     #[test]
@@ -836,12 +831,10 @@ mod mask_contract_tests {
         let mut pol = ProtectionPolicy::strict_all();
         pol.set(Protection::FsIoctlDev, ProtectionState::Disabled);
         let mask = compute_fs_mask(6, &pol);
-        assert_eq!(mask & LANDLOCK_ACCESS_FS_IOCTL_DEV, 0);
-        assert_eq!(mask & LANDLOCK_ACCESS_FS_REFER, LANDLOCK_ACCESS_FS_REFER);
-        assert_eq!(
-            mask & LANDLOCK_ACCESS_FS_TRUNCATE,
-            LANDLOCK_ACCESS_FS_TRUNCATE
-        );
+        let mask = BitFlags::<AccessFs>::from_bits(mask).unwrap();
+        assert!(!mask.contains(AccessFs::IoctlDev));
+        assert!(mask.contains(AccessFs::Refer));
+        assert!(mask.contains(AccessFs::Truncate));
     }
 
     #[test]
@@ -853,9 +846,9 @@ mod mask_contract_tests {
         let mut pol = ProtectionPolicy::strict_all();
         pol.set(Protection::FsIoctlDev, ProtectionState::Degradable);
         let mask = compute_fs_mask(4, &pol);
-        assert_eq!(
-            mask & LANDLOCK_ACCESS_FS_IOCTL_DEV,
-            0,
+        let mask = BitFlags::<AccessFs>::from_bits(mask).unwrap();
+        assert!(
+            !mask.contains(AccessFs::IoctlDev),
             "Degraded FsIoctlDev on a v4 host must NOT contribute the IOCTL_DEV bit",
         );
     }
@@ -873,7 +866,8 @@ mod mask_contract_tests {
         let pol = ProtectionPolicy::strict_all();
         let sb = empty_sandbox();
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, false);
-        assert_eq!(mask, 0, "handle_net=false → mask is zero");
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
+        assert!(mask.is_empty(), "handle_net=false → mask is zero");
         assert!(!wildcard, "handle_net=false → wildcard is false");
     }
 
@@ -882,9 +876,10 @@ mod mask_contract_tests {
         let pol = ProtectionPolicy::strict_all();
         let sb = empty_sandbox();
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
         assert_eq!(
             mask,
-            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            AccessNet::BindTcp | AccessNet::ConnectTcp,
             "strict NetTcp with no wildcard rule → both BIND_TCP and CONNECT_TCP",
         );
         assert!(!wildcard);
@@ -896,8 +891,9 @@ mod mask_contract_tests {
         pol.set(Protection::NetTcp, ProtectionState::Disabled);
         let sb = empty_sandbox();
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
-        assert_eq!(
-            mask, 0,
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
+        assert!(
+            mask.is_empty(),
             "disabled NetTcp must produce mask=0 regardless of handle_net",
         );
         assert!(!wildcard);
@@ -911,7 +907,8 @@ mod mask_contract_tests {
         pol.set(Protection::NetTcp, ProtectionState::Degradable);
         let sb = empty_sandbox();
         let (mask, wildcard) = compute_net_mask(3, &pol, &sb, true);
-        assert_eq!(mask, 0);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
+        assert!(mask.is_empty());
         assert!(!wildcard);
     }
 
@@ -927,8 +924,10 @@ mod mask_contract_tests {
             .expect("net_deny sandbox builds");
         assert!(!sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
         assert_eq!(
-            mask, LANDLOCK_ACCESS_NET_BIND_TCP,
+            mask,
+            BitFlags::from(AccessNet::BindTcp),
             "deny-only must drop CONNECT_TCP so all TCP connects reach the on-behalf path",
         );
         assert!(wildcard, "deny-only must set the wildcard flag");
@@ -946,13 +945,14 @@ mod mask_contract_tests {
             .expect("combined sandbox builds");
         assert!(sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
         assert!(
             !wildcard,
             "combined finite must not force the connect wildcard"
         );
         assert_eq!(
             mask,
-            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            AccessNet::BindTcp | AccessNet::ConnectTcp,
             "combined finite keeps both TCP hooks",
         );
     }
@@ -978,7 +978,8 @@ mod mask_contract_tests {
             wildcard,
             "an approvable *:* must not leave CONNECT_TCP gated"
         );
-        assert_eq!(mask & LANDLOCK_ACCESS_NET_CONNECT_TCP, 0);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
+        assert!(!mask.contains(AccessNet::ConnectTcp));
     }
 
     #[test]
@@ -1031,10 +1032,10 @@ mod mask_contract_tests {
             .build()
             .expect("combined wildcard sandbox builds");
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
         assert!(wildcard, "combined wildcard must set the wildcard flag");
-        assert_eq!(
-            mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
-            0,
+        assert!(
+            !mask.contains(AccessNet::ConnectTcp),
             "combined wildcard must drop CONNECT_TCP",
         );
     }
@@ -1053,13 +1054,14 @@ mod mask_contract_tests {
         assert!(sb.net_allow.is_empty());
         assert!(sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
         assert!(
             !wildcard,
             "http-only finite must not force the connect wildcard"
         );
         assert_eq!(
             mask,
-            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            AccessNet::BindTcp | AccessNet::ConnectTcp,
             "http-only keeps both TCP hooks",
         );
     }
@@ -1078,9 +1080,11 @@ mod mask_contract_tests {
         assert!(sb.net_allow.is_empty());
         assert!(!sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
         assert!(wildcard, "deny-only+http must set the wildcard flag");
         assert_eq!(
-            mask, LANDLOCK_ACCESS_NET_BIND_TCP,
+            mask,
+            BitFlags::from(AccessNet::BindTcp),
             "deny-only+http must drop CONNECT_TCP",
         );
     }
@@ -1097,13 +1101,14 @@ mod mask_contract_tests {
             .expect("combined+http sandbox builds");
         assert!(sb.net_allow_is_active());
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
         assert!(
             !wildcard,
             "combined+http finite must not force the connect wildcard"
         );
         assert_eq!(
             mask,
-            LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            AccessNet::BindTcp | AccessNet::ConnectTcp,
             "combined+http keeps both TCP hooks",
         );
     }
@@ -1119,14 +1124,13 @@ mod mask_contract_tests {
             .build()
             .expect("bind-zero sandbox builds");
         let (mask, _) = compute_net_mask(6, &pol, &sb, true);
-        assert_ne!(
-            mask & LANDLOCK_ACCESS_NET_BIND_TCP,
-            0,
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
+        assert!(
+            mask.contains(AccessNet::BindTcp),
             "bind port 0 must keep the Landlock BIND_TCP gate",
         );
-        assert_ne!(
-            mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
-            0,
+        assert!(
+            mask.contains(AccessNet::ConnectTcp),
             "bind-zero must not affect CONNECT_TCP handling",
         );
     }
@@ -1143,14 +1147,13 @@ mod mask_contract_tests {
             .build()
             .expect("net_deny_bind sandbox builds");
         let (mask, _wildcard) = compute_net_mask(6, &pol, &sb, true);
-        assert_eq!(
-            mask & LANDLOCK_ACCESS_NET_BIND_TCP,
-            0,
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
+        assert!(
+            !mask.contains(AccessNet::BindTcp),
             "net_deny_bind must drop BIND_TCP so all TCP binds reach the on-behalf path",
         );
-        assert_ne!(
-            mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
-            0,
+        assert!(
+            mask.contains(AccessNet::ConnectTcp),
             "net_deny_bind must not affect CONNECT_TCP handling",
         );
     }
@@ -1164,14 +1167,13 @@ mod mask_contract_tests {
             .build()
             .expect("combined bind policy builds");
         let (mask, _wildcard) = compute_net_mask(6, &pol, &sb, true);
-        assert_eq!(
-            mask & LANDLOCK_ACCESS_NET_BIND_TCP,
-            0,
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
+        assert!(
+            !mask.contains(AccessNet::BindTcp),
             "combined bind policy must let the supervisor apply deny precedence",
         );
-        assert_ne!(
-            mask & LANDLOCK_ACCESS_NET_CONNECT_TCP,
-            0,
+        assert!(
+            mask.contains(AccessNet::ConnectTcp),
             "bind policy must not alter CONNECT_TCP handling",
         );
     }
@@ -1187,8 +1189,10 @@ mod mask_contract_tests {
             .build()
             .expect("wildcard allow-bind sandbox builds");
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
         assert_eq!(
-            mask, LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            mask,
+            BitFlags::from(AccessNet::ConnectTcp),
             "bind-all must drop BIND_TCP from the handled set and keep CONNECT_TCP",
         );
         assert!(!wildcard, "bind-all must not force the connect wildcard");
@@ -1205,7 +1209,11 @@ mod mask_contract_tests {
             .build()
             .expect("net_deny + wildcard allow-bind sandbox builds");
         let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
-        assert_eq!(mask, 0, "net_deny + bind-all leaves no handled net access");
+        let mask = BitFlags::<AccessNet>::from_bits(mask).unwrap();
+        assert!(
+            mask.is_empty(),
+            "net_deny + bind-all leaves no handled net access"
+        );
         assert!(wildcard, "net_deny must still set the wildcard flag");
     }
 }

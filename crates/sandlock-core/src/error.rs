@@ -143,3 +143,9 @@ pub enum BranchError {
 
 /// Convenience type alias.
 pub type Result<T> = std::result::Result<T, SandlockError>;
+
+impl From<ConfinementError> for SandlockError {
+    fn from(value: ConfinementError) -> Self {
+        Self::Runtime(SandboxRuntimeError::Confinement(value))
+    }
+}
