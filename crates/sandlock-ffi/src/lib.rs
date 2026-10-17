@@ -2467,7 +2467,11 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
         return b;
     }
     let builder = *Box::from_raw(b);
-    let state = PolicyCallbackState { cb, user_data, user_data_drop };
+    let state = PolicyCallbackState {
+        cb,
+        user_data,
+        user_data_drop,
+    };
     let cb_fn = move |event: sandlock_core::policy_fn::SyscallEvent,
                       ctx: &mut sandlock_core::policy_fn::PolicyContext,
                       approval: Option<sandlock_core::policy_fn::Approval>| {
@@ -2494,9 +2498,14 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
 /// # Safety
 /// `approval` must be null or an approval not yet resolved or freed.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_approval_resolve(approval: *mut sandlock_approval_t, verdict: i32) {
+pub unsafe extern "C" fn sandlock_approval_resolve(
+    approval: *mut sandlock_approval_t,
+    verdict: i32,
+) {
     if !approval.is_null() {
-        Box::from_raw(approval).approval.resolve(policy_ret_to_verdict(verdict));
+        Box::from_raw(approval)
+            .approval
+            .resolve(policy_ret_to_verdict(verdict));
     }
 }
 
@@ -2506,7 +2515,9 @@ pub unsafe extern "C" fn sandlock_approval_resolve(approval: *mut sandlock_appro
 /// # Safety
 /// `approval` must be null or a live approval.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_approval_is_cancelled(approval: *const sandlock_approval_t) -> bool {
+pub unsafe extern "C" fn sandlock_approval_is_cancelled(
+    approval: *const sandlock_approval_t,
+) -> bool {
     approval.is_null() || (*approval).approval.is_cancelled()
 }
 

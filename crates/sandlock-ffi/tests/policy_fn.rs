@@ -76,7 +76,9 @@ unsafe extern "C" fn drop_approver(user_data: *mut c_void) {
 /// `Some(verdict)` resolves, `None` frees it unresolved.
 fn run_with_approver(verdict: Option<i32>) -> bool {
     let (tx, rx) = std::sync::mpsc::channel::<usize>();
-    let approver = Box::into_raw(Box::new(Approver { tx: std::sync::Mutex::new(tx) }));
+    let approver = Box::into_raw(Box::new(Approver {
+        tx: std::sync::Mutex::new(tx),
+    }));
     let resolver = std::thread::spawn(move || {
         for approval in rx {
             let approval = approval as *mut sandlock_approval_t;

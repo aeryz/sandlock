@@ -46,9 +46,9 @@ fn sysno(name: &str) -> Option<i64> {
 macro_rules! legacy_syscall {
     ($fn:ident, $name:literal) => {
         #[doc = concat!(
-                    "`", $name, "` syscall number on this architecture, or `None` if ",
-                    "the generic syscall ABI (aarch64, riscv64) omits it."
-                )]
+                            "`", $name, "` syscall number on this architecture, or `None` if ",
+                            "the generic syscall ABI (aarch64, riscv64) omits it."
+                        )]
         pub fn $fn() -> Option<i64> {
             sysno($name)
         }
