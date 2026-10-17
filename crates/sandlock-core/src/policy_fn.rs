@@ -136,7 +136,9 @@ impl SyscallEvent {
     /// Returns true if any argv element contains the given substring.
     /// Only meaningful for execve/execveat events (where argv is populated).
     pub fn argv_contains(&self, s: &str) -> bool {
-        self.argv.as_ref().map_or(false, |args| args.iter().any(|a| a.contains(s)))
+        self.argv
+            .as_ref()
+            .map_or(false, |args| args.iter().any(|a| a.contains(s)))
     }
 }
 
@@ -334,7 +336,9 @@ pub enum Verdict {
 }
 
 impl Default for Verdict {
-    fn default() -> Self { Verdict::Allow }
+    fn default() -> Self {
+        Verdict::Allow
+    }
 }
 
 /// A callback function invoked for each intercepted syscall.
@@ -399,7 +403,11 @@ impl PolicyFn {
         Self::deferred(move |event, ctx, approval| {
             let verdict = callback(event, ctx);
             if let Some(approval) = approval {
-                approval.resolve(if ctx.is_cancelled() { Verdict::Deny } else { verdict });
+                approval.resolve(if ctx.is_cancelled() {
+                    Verdict::Deny
+                } else {
+                    verdict
+                });
             }
         })
     }
@@ -664,7 +672,8 @@ mod tests {
                     .unwrap();
             }
             Verdict::Allow
-        }).callback;
+        })
+        .callback;
         let worker = spawn_policy_fn(
             callback,
             Arc::new(RwLock::new(test_live())),
@@ -716,7 +725,8 @@ mod tests {
                 "shutdown did not cancel the running callback"
             );
             Verdict::Allow
-        }).callback;
+        })
+        .callback;
         let worker = spawn_policy_fn(
             callback,
             Arc::new(RwLock::new(test_live())),
@@ -752,21 +762,33 @@ mod tests {
     #[tokio::test]
     async fn dropped_approval_denies() {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        drop(Approval { gate: tx, cancellation: CancellationToken::new() });
-        assert_eq!(wait_for_verdict(rx, None, &CancellationToken::new()).await, Verdict::Deny);
+        drop(Approval {
+            gate: tx,
+            cancellation: CancellationToken::new(),
+        });
+        assert_eq!(
+            wait_for_verdict(rx, None, &CancellationToken::new()).await,
+            Verdict::Deny
+        );
     }
 
     #[test]
     fn approval_reports_timeout_and_shutdown() {
         let (tx, rx) = tokio::sync::oneshot::channel::<Verdict>();
         let cancellation = CancellationToken::new();
-        let approval = Approval { gate: tx, cancellation: cancellation.clone() };
+        let approval = Approval {
+            gate: tx,
+            cancellation: cancellation.clone(),
+        };
         assert!(!approval.is_cancelled());
         cancellation.cancel();
         assert!(approval.is_cancelled());
 
         let (tx, rx2) = tokio::sync::oneshot::channel::<Verdict>();
-        let approval = Approval { gate: tx, cancellation: CancellationToken::new() };
+        let approval = Approval {
+            gate: tx,
+            cancellation: CancellationToken::new(),
+        };
         drop(rx2);
         assert!(approval.is_cancelled());
         drop(rx);
@@ -777,8 +799,13 @@ mod tests {
         let (approvals_tx, approvals_rx) = std::sync::mpsc::channel();
         let approvals_tx = std::sync::Mutex::new(approvals_tx);
         let callback = PolicyFn::deferred(move |_e, _ctx, approval| {
-            approvals_tx.lock().unwrap().send(approval.unwrap()).unwrap();
-        }).callback;
+            approvals_tx
+                .lock()
+                .unwrap()
+                .send(approval.unwrap())
+                .unwrap();
+        })
+        .callback;
         let worker = spawn_policy_fn(
             callback,
             Arc::new(RwLock::new(test_live())),
@@ -789,14 +816,19 @@ mod tests {
         let (first_tx, first_rx) = tokio::sync::oneshot::channel();
         let (second_tx, second_rx) = tokio::sync::oneshot::channel();
         for gate in [first_tx, second_tx] {
-            worker.sender().send(PolicyMsg::Event(PolicyEvent {
-                event: test_event(),
-                gate: Some(gate),
-            })).unwrap();
+            worker
+                .sender()
+                .send(PolicyMsg::Event(PolicyEvent {
+                    event: test_event(),
+                    gate: Some(gate),
+                }))
+                .unwrap();
         }
         let first = approvals_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let second = approvals_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        std::thread::spawn(move || second.resolve(Verdict::DenyWith(13))).join().unwrap();
+        std::thread::spawn(move || second.resolve(Verdict::DenyWith(13)))
+            .join()
+            .unwrap();
         first.allow();
         assert_eq!(second_rx.blocking_recv(), Ok(Verdict::DenyWith(13)));
         assert_eq!(first_rx.blocking_recv(), Ok(Verdict::Allow));
