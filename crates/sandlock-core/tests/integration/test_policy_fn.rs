@@ -1178,34 +1178,45 @@ async fn pending_approval_does_not_stall_supervisor() {
 
     let policy = base_policy()
         .net_allow(format!("127.0.0.1:{port}"))
-        .policy_fn(PolicyFn::new(move |event, _ctx| {
-            if event.syscall == "connect" && event.port == Some(port) {
-                let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                while std::time::Instant::now() < deadline {
-                    if watched.exists() {
-                        observed.store(true, std::sync::atomic::Ordering::SeqCst);
-                        break;
+        .policy_fn(
+            PolicyFn::new(move |event, _ctx| {
+                if event.syscall == "connect" && event.port == Some(port) {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                    while std::time::Instant::now() < deadline {
+                        if watched.exists() {
+                            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    std::thread::sleep(Duration::from_millis(10));
                 }
-            }
-            Verdict::Allow
-        }).verdict_timeout(Some(Duration::from_secs(10))))
+                Verdict::Allow
+            })
+            .verdict_timeout(Some(Duration::from_secs(10))),
+        )
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import os, socket, threading, time\n",
-        "def dial():\n",
-        "  socket.create_connection(('127.0.0.1', {port}), timeout=10)\n",
-        "t = threading.Thread(target=dial)\n",
-        "t.start()\n",
-        "time.sleep(0.2)\n",
-        "os.mkdir('{marker}')\n",
-        "t.join()\n",
-    ), port = port, marker = marker.display());
+    let script = format!(
+        concat!(
+            "import os, socket, threading, time\n",
+            "def dial():\n",
+            "  socket.create_connection(('127.0.0.1', {port}), timeout=10)\n",
+            "t = threading.Thread(target=dial)\n",
+            "t.start()\n",
+            "time.sleep(0.2)\n",
+            "os.mkdir('{marker}')\n",
+            "t.join()\n",
+        ),
+        port = port,
+        marker = marker.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     let _ = std::fs::remove_dir(&marker);
     assert!(result.success());
     assert!(
@@ -1230,24 +1241,34 @@ async fn argv_rewritten_during_approval_is_refused() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import ctypes, threading, time\n",
-        "libc = ctypes.CDLL(None, use_errno=True)\n",
-        "arg = ctypes.create_string_buffer(b'safe')\n",
-        "argv = (ctypes.c_char_p * 3)(b'/bin/echo', ctypes.cast(arg, ctypes.c_char_p), None)\n",
-        "def rewrite():\n",
-        "  time.sleep(0.05)\n",
-        "  ctypes.memmove(arg, b'evil', 4)\n",
-        "threading.Thread(target=rewrite).start()\n",
-        "libc.execv(b'/bin/echo', argv)\n",
-        "open('{out}', 'w').write('ERRNO:%d' % ctypes.get_errno())\n",
-    ), out = out.display());
+    let script = format!(
+        concat!(
+            "import ctypes, threading, time\n",
+            "libc = ctypes.CDLL(None, use_errno=True)\n",
+            "arg = ctypes.create_string_buffer(b'safe')\n",
+            "argv = (ctypes.c_char_p * 3)(b'/bin/echo', ctypes.cast(arg, ctypes.c_char_p), None)\n",
+            "def rewrite():\n",
+            "  time.sleep(0.05)\n",
+            "  ctypes.memmove(arg, b'evil', 4)\n",
+            "threading.Thread(target=rewrite).start()\n",
+            "libc.execv(b'/bin/echo', argv)\n",
+            "open('{out}', 'w').write('ERRNO:%d' % ctypes.get_errno())\n",
+        ),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_file(&out);
     assert!(result.success());
-    assert_eq!(content, "ERRNO:1", "exec of rewritten argv must fail with EPERM");
+    assert_eq!(
+        content, "ERRNO:1",
+        "exec of rewritten argv must fail with EPERM"
+    );
 }
 
 /// Siblings frozen for an allowed exec die in de_thread as tracees; the
@@ -1305,19 +1326,28 @@ async fn deferred_approval_resolved_by_later_event() {
         .build()
         .unwrap();
 
-    let script = format!(concat!(
-        "import os, socket, threading, time\n",
-        "def dial():\n",
-        "  socket.create_connection(('127.0.0.1', {port}), timeout=10)\n",
-        "  open('{out}', 'w').write('CONNECTED')\n",
-        "t = threading.Thread(target=dial)\n",
-        "t.start()\n",
-        "time.sleep(0.2)\n",
-        "os.mkdir('{marker}')\n",
-        "t.join()\n",
-    ), port = port, marker = marker.display(), out = out.display());
+    let script = format!(
+        concat!(
+            "import os, socket, threading, time\n",
+            "def dial():\n",
+            "  socket.create_connection(('127.0.0.1', {port}), timeout=10)\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "t = threading.Thread(target=dial)\n",
+            "t.start()\n",
+            "time.sleep(0.2)\n",
+            "os.mkdir('{marker}')\n",
+            "t.join()\n",
+        ),
+        port = port,
+        marker = marker.display(),
+        out = out.display()
+    );
 
-    let result = policy.clone().run_interactive(&["python3", "-c", &script]).await.unwrap();
+    let result = policy
+        .clone()
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
     let content = std::fs::read_to_string(&out).unwrap_or_default();
     let _ = std::fs::remove_dir(&marker);
     let _ = std::fs::remove_file(&out);
