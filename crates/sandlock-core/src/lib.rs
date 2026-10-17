@@ -22,7 +22,7 @@ pub(crate) mod freeze;
 pub mod http;
 #[cfg(feature = "image")]
 pub mod image;
-pub mod landlock;
+pub mod landlock_policy;
 pub mod logging;
 pub mod netlink;
 pub(crate) mod network;
@@ -86,11 +86,13 @@ pub use seccomp::syscall::{Syscall, SyscallError};
 
 /// Query the Landlock ABI version supported by the running kernel.
 pub fn landlock_abi_version() -> Result<u32, error::ConfinementError> {
-    landlock::abi_version()
+    // Return `u32` instead of `landlock::ABI` because the running kernel may
+    // support a newer ABI version than the `landlock` crate recognizes.
+    landlock_policy::abi_version()
 }
 
 /// Minimum Landlock ABI version required by sandlock.
-pub const MIN_LANDLOCK_ABI: u32 = landlock::MIN_ABI;
+pub const MIN_LANDLOCK_ABI: u32 = landlock_policy::MIN_ABI;
 
 /// Confine the calling process with Landlock restrictions.
 ///
@@ -120,5 +122,5 @@ pub fn confine(confinement: &Confinement) -> Result<(), SandlockError> {
     let stripped = builder.build()?;
 
     // Apply Landlock filesystem rules.
-    landlock::confine_filesystem(&stripped)
+    landlock_policy::confine_filesystem(&stripped)
 }
