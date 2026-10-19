@@ -584,8 +584,17 @@ pub(crate) fn resolve_descriptor_path(
     notif: &SeccompNotif,
     path: &str,
 ) -> Option<std::path::PathBuf> {
+    if !path.starts_with("/proc/") && !path.starts_with("/dev/") {
+        return None;
+    }
     let tid = notif.pid as i32;
-    let tgid = tgid_of(notif.pid).unwrap_or(notif.pid) as i32;
+    // Only a numeric spelling is matched against the tgid, so read it only then.
+    let tgid = match path.strip_prefix("/proc/").and_then(|rest| rest.split('/').next()) {
+        Some(task) if !task.is_empty() && task.bytes().all(|b| b.is_ascii_digit()) => {
+            tgid_of(notif.pid).unwrap_or(notif.pid) as i32
+        }
+        _ => tid,
+    };
     let (fd, tail) = crate::procfs::own_fd_path_tail(path, tid, tgid)?;
     let base = open_base_dir(notif.pid, fd as i64).ok()?;
 
