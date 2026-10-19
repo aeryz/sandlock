@@ -583,19 +583,17 @@ pub(crate) fn open_base_dir(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
 pub(crate) fn resolve_descriptor_path(
     notif: &SeccompNotif,
     path: &str,
-    follow: bool,
 ) -> Option<std::path::PathBuf> {
     let tid = notif.pid as i32;
     let tgid = tgid_of(notif.pid).unwrap_or(notif.pid) as i32;
     let (fd, tail) = crate::procfs::own_fd_path_tail(path, tid, tgid)?;
     let base = open_base_dir(notif.pid, fd as i64).ok()?;
-    let nofollow = |last: bool| if last && !follow { libc::O_NOFOLLOW } else { 0 };
 
     let c_tail = std::ffi::CString::new(tail.as_str()).ok()?;
     if let Ok(entry) = openat2_at(
         base.as_raw_fd(),
         &c_tail,
-        (libc::O_PATH | libc::O_CLOEXEC | nofollow(true)) as u64,
+        (libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
         0,
         RESOLVE_NO_MAGICLINKS,
     ) {

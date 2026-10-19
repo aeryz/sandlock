@@ -478,8 +478,6 @@ async fn test_seccomp_cow_openat2_syscall() {
     let _ = fs::remove_file(&out_file);
 }
 
-/// renameat must land in the COW layer like rename and renameat2.
-///
 /// A path through one of the caller's own descriptors names a file the branch
 /// owns, under a spelling that does not look like it, so the change belongs in
 /// the branch and an abort takes it back.
@@ -526,6 +524,8 @@ async fn test_seccomp_cow_change_through_a_descriptor_path_is_staged() {
     let _ = fs::remove_file(&out_file);
 }
 
+/// renameat must land in the COW layer like rename and renameat2.
+///
 /// Regression test: COW registered renameat2 and legacy rename but not
 /// renameat, so a raw renameat under the workdir renamed the real file and
 /// survived an abort. On aarch64 libc's rename() compiles to renameat, so
