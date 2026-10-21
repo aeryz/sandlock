@@ -71,6 +71,28 @@ func TestWaitTimeoutKeepsTheSession(t *testing.T) {
 	}
 }
 
+func TestJoinWaitsForJobs(t *testing.T) {
+	requireLandlock(t)
+	sb := &sandlock.Sandbox{FSReadable: rootfs}
+	p, err := sb.Spawn("sh", "-c", "sleep 1 & exit 7")
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer p.Close()
+	if _, err := p.JoinTimeout(100 * time.Millisecond); err != sandlock.ErrTimeout {
+		t.Fatalf("JoinTimeout: want ErrTimeout while the job runs, got %v", err)
+	}
+	if st, err := p.Join(); err != nil || st.ExitCode != 7 {
+		t.Fatalf("Join: %+v %v", st, err)
+	}
+	if groups, err := p.ProcessGroups(); err != nil || len(groups) != 0 {
+		t.Fatalf("Join left a job behind: %v %v", groups, err)
+	}
+	if res, err := p.Shutdown(); err != nil || res.ExitCode != 7 {
+		t.Fatalf("Shutdown: %+v %v", res, err)
+	}
+}
+
 func TestShutdownEndsABlockedWait(t *testing.T) {
 	requireLandlock(t)
 	sb := &sandlock.Sandbox{FSReadable: rootfs}
