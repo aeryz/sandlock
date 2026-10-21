@@ -42,6 +42,25 @@ def test_wait_keeps_jobs_until_shutdown():
         assert gone(job)
 
 
+def test_join_waits_for_jobs_and_returns_mains_status():
+    with policy().popen(["sh", "-c", "sleep 1 & echo $!; exit 7"], stdout=StdioMode.PIPED) as proc:
+        job = int(proc.stdout.readline())
+        with pytest.raises(TimeoutError):
+            proc.join(timeout=0.1)
+        assert alive(job)
+        assert proc.join(timeout=5).exit_code == 7
+        assert not alive(job) and not proc.process_groups()
+        assert proc.shutdown().exit_code == 7
+
+
+def test_sandbox_join_waits_for_jobs():
+    sb = policy()
+    sb.spawn(["sh", "-c", "sleep 0.5 & exit 3"])
+    assert sb.join(timeout=5).exit_code == 3
+    assert not sb.process_groups()
+    assert sb.shutdown().exit_code == 3
+
+
 def test_wait_timeout_keeps_the_session():
     sb = policy()
     sb.spawn(["sleep", "60"])

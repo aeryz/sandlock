@@ -331,7 +331,7 @@ result = sandbox.run(["python3", "-c", "print(42)"], timeout=10.0)
 #### `sandbox.spawn(cmd) -> None`
 
 Spawn `cmd` without waiting. Use `pid`, `pause()`, `resume()`, `kill()`,
-`wait()` and `shutdown()` to manage the session.
+`wait()`, `join()` and `shutdown()` to manage the session.
 
 Raises `RuntimeError` if a process is already running.
 
@@ -359,14 +359,20 @@ Wait for the main process and return its `ExitStatus`. Background jobs it
 started keep running under supervision. A `timeout` raises `TimeoutError`
 and leaves the session running.
 
+#### `sandbox.join(timeout=None) -> ExitStatus`
+
+Like `wait()`, but also wait until every background job has exited, so
+`shutdown()` has nothing left to kill. Returns main's `ExitStatus`. A
+`timeout` raises `TimeoutError` and leaves the session running.
+
 #### `sandbox.shutdown() -> Result`
 
 Kill whatever is left of the session, wait until it has no process, and
 return the `Result` with captured output and filesystem changes.
 
 `kill()`, `pause()`, `resume()` and `process_groups()` work from any
-thread, including while another thread is blocked in `wait()`. A
-`popen()` `Process` has the same `wait()`, `shutdown()` and
+thread, including while another thread is blocked in `wait()` or `join()`.
+A `popen()` `Process` has the same `wait()`, `join()`, `shutdown()` and
 `process_groups()`.
 
 #### Inspecting and deferring COW changes

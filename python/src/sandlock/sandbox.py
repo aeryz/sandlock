@@ -1103,6 +1103,15 @@ class Sandbox:
             RuntimeError: If the sandbox is not running, or a :meth:`popen`
                 :class:`Process` owns the child (wait on that Process instead).
         """
+        return self._wait_for(timeout, join=False)
+
+    def join(self, timeout: float | None = None) -> "ExitStatus":
+        """Like :meth:`wait`, but also wait until every background job has
+        exited, so a following :meth:`shutdown` has nothing to kill. A timeout
+        raises ``TimeoutError`` and leaves the session running."""
+        return self._wait_for(timeout, join=True)
+
+    def _wait_for(self, timeout, join):
         self._reject_if_popen()
         with self._idle:
             handle = self._handle
@@ -1110,7 +1119,7 @@ class Sandbox:
                 raise RuntimeError("sandbox is not running")
             self._waiting += 1
         try:
-            return _wait(handle, timeout)
+            return _wait(handle, timeout, join)
         finally:
             with self._idle:
                 self._waiting -= 1
@@ -1673,6 +1682,14 @@ class Process:
         can exit. Background jobs stay supervised until :meth:`shutdown`. A
         timeout raises ``TimeoutError`` and leaves the session running.
         """
+        return self._wait_for(timeout, join=False)
+
+    def join(self, timeout: float | None = None) -> "ExitStatus":
+        """Like :meth:`wait`, but also wait until every background job has
+        exited, so a following :meth:`shutdown` has nothing to kill."""
+        return self._wait_for(timeout, join=True)
+
+    def _wait_for(self, timeout, join):
         from ._sdk import ExitStatus
         with self._idle:
             handle = self._handle
@@ -1688,7 +1705,7 @@ class Process:
             except OSError:
                 pass
         try:
-            return _wait(handle, timeout)
+            return _wait(handle, timeout, join)
         finally:
             with self._idle:
                 self._waiting -= 1
@@ -1761,17 +1778,18 @@ class Process:
             pass
 
 
-def _wait(handle, timeout):
+def _wait(handle, timeout, join=False):
     import ctypes
     import math
     from ._sdk import _c_result_p, _lib, ExitReason, ExitStatus
     ms = 0 if timeout is None else max(1, math.ceil(timeout * 1000))
     ptr = _c_result_p()
-    rc = _lib.sandlock_handle_wait(handle, ms, ctypes.byref(ptr))
+    name = "sandlock_handle_join" if join else "sandlock_handle_wait"
+    rc = getattr(_lib, name)(handle, ms, ctypes.byref(ptr))
     if rc == 1:
-        raise TimeoutError("main process has not exited")
+        raise TimeoutError("session still has processes" if join else "main process has not exited")
     if rc != 0:
-        raise RuntimeError("sandlock_handle_wait failed")
+        raise RuntimeError(f"{name} failed")
     try:
         return ExitStatus(
             success=bool(_lib.sandlock_result_success(ptr)),
