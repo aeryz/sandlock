@@ -18,6 +18,11 @@ sandlock run -r /usr -r /lib -r /lib64 -r /bin -r /etc -w /tmp -- /bin/sh
 # Resource limits + timeout
 sandlock run -m 512M -P 20 -t 30 -- ./compute.sh
 
+# Background jobs end when the command exits; -j/--wait-jobs keeps them
+# running, still confined, until they finish. The exit status stays the
+# command's, and -t or Ctrl-C ends the jobs too.
+sandlock run -j -r /usr -r /lib -r /bin -r /dev -- sh -c './server & ./client'
+
 # GPU access (NVIDIA): `--gpu all` for every GPU, or indices like `0,2`.
 # Selection is a hard Landlock boundary: only the chosen /dev/nvidiaN nodes
 # are openable, so a sandbox given `--gpu 0` cannot touch other GPUs. The

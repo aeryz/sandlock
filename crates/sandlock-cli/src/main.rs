@@ -133,6 +133,11 @@ struct RunArgs {
     #[arg(long = "status-fd", value_name = "FD")]
     status_fd: Option<i32>,
 
+    /// After the command exits, keep its background jobs running under
+    /// supervision until they finish; exit with the command's status
+    #[arg(short = 'j', long = "wait-jobs")]
+    wait_jobs: bool,
+
     /// Sandbox name (also exposed as the virtual hostname; auto-generated if omitted)
     #[arg(long)]
     name: Option<String>,
@@ -928,13 +933,18 @@ async fn run_command(args: RunArgs) -> Result<i32> {
         policy.on_error = BranchAction::Abort;
     }
 
+    let run = async {
+        if args.wait_jobs {
+            policy.create_interactive(&cmd_strs).await?;
+            policy.start()?;
+            policy.join().await?;
+            policy.shutdown().await
+        } else {
+            policy.run_interactive(&cmd_strs).await
+        }
+    };
     let result = if let Some(secs) = args.timeout {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(secs),
-            policy.run_interactive(&cmd_strs),
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(secs), run).await {
             Ok(r) => r?,
             Err(_) => {
                 eprintln!("sandlock: timeout after {}s", secs);
@@ -942,7 +952,7 @@ async fn run_command(args: RunArgs) -> Result<i32> {
             }
         }
     } else {
-        policy.run_interactive(&cmd_strs).await?
+        run.await?
     };
 
     if args.dry_run {

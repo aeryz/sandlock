@@ -69,6 +69,49 @@ fn test_run_exit_code() {
     assert_eq!(output.status.code(), Some(42));
 }
 
+/// Without --wait-jobs, a job the command leaves behind dies with the run.
+#[test]
+fn test_run_wait_jobs() {
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&[
+            "-r",
+            "/usr",
+            "-r",
+            "/lib",
+            "-r",
+            "/lib64",
+            "-r",
+            "/bin",
+            "-r",
+            "/dev",
+            "--",
+            "sh",
+            "-c",
+            "(sleep 0.5; echo job-done) & echo main-done; exit 3",
+        ]);
+        sandlock_bin()
+            .args(args_for_host(&args))
+            .output()
+            .expect("failed to run sandlock")
+    };
+
+    for flag in ["--wait-jobs", "-j"] {
+        let output = run(&[flag]);
+        assert_eq!(output.status.code(), Some(3), "{flag}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "main-done\njob-done\n",
+            "{flag}"
+        );
+    }
+
+    let output = run(&[]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "main-done\n");
+}
+
 #[test]
 fn test_run_denied_path() {
     let output = sandlock_bin()
