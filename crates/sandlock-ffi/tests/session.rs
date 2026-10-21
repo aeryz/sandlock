@@ -6,11 +6,11 @@ use std::os::raw::{c_char, c_int, c_uint};
 use std::ptr;
 
 use sandlock_ffi::{
-    sandlock_handle_free, sandlock_handle_kill, sandlock_handle_process_groups,
-    sandlock_handle_shutdown, sandlock_handle_t, sandlock_handle_wait, sandlock_popen,
-    sandlock_result_free, sandlock_result_success, sandlock_sandbox_build,
-    sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_new, sandlock_sandbox_free,
-    sandlock_sandbox_t, sandlock_string_free,
+    sandlock_handle_free, sandlock_handle_join, sandlock_handle_kill,
+    sandlock_handle_process_groups, sandlock_handle_shutdown, sandlock_handle_t,
+    sandlock_handle_wait, sandlock_popen, sandlock_result_exit_code, sandlock_result_free,
+    sandlock_result_success, sandlock_sandbox_build, sandlock_sandbox_builder_fs_read,
+    sandlock_sandbox_builder_new, sandlock_sandbox_free, sandlock_sandbox_t, sandlock_string_free,
 };
 
 const INHERIT: u32 = 0;
@@ -88,6 +88,29 @@ fn wait_timeout_leaves_the_session_alive() {
     assert_ne!(listed, "[]", "the session is still running");
     unsafe {
         sandlock_string_free(groups);
+        sandlock_result_free(sandlock_handle_shutdown(h));
+        sandlock_handle_free(h);
+        sandlock_sandbox_free(policy);
+    }
+}
+
+#[test]
+fn join_waits_for_jobs_main_left_behind() {
+    let policy = build_policy();
+    let h = popen(policy, &["sh", "-c", "sleep 1 & exit 3"]);
+    let mut status = ptr::null_mut();
+    assert_eq!(unsafe { sandlock_handle_join(h, 100, &mut status) }, 1);
+    assert!(status.is_null());
+    assert_eq!(unsafe { sandlock_handle_join(h, 5000, &mut status) }, 0);
+    assert_eq!(unsafe { sandlock_result_exit_code(status) }, 3);
+    let groups = unsafe { sandlock_handle_process_groups(h) };
+    let listed = unsafe { CStr::from_ptr(groups) }
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(listed, "[]", "join leaves no job behind");
+    unsafe {
+        sandlock_string_free(groups);
+        sandlock_result_free(status);
         sandlock_result_free(sandlock_handle_shutdown(h));
         sandlock_handle_free(h);
         sandlock_sandbox_free(policy);
