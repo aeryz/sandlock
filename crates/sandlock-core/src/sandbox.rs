@@ -2644,36 +2644,25 @@ impl Sandbox {
             }
 
             if let Some(ref policy_fn) = self.policy_fn {
-                let mut allowed_ips: std::collections::HashSet<std::net::IpAddr> =
-                    std::collections::HashSet::new();
-                for p in [
-                    &net_state.tcp_policy,
-                    &net_state.udp_policy,
-                    &net_state.icmp_policy,
-                ] {
-                    if let crate::seccomp::notif::NetworkPolicy::AllowList {
-                        per_ip, cidrs, ..
-                    } = p
-                    {
-                        allowed_ips.extend(per_ip.keys().copied());
-                        // IP literals resolve to single-host CIDRs (/32 or
-                        // /128); surface them as concrete allowed IPs too.
-                        for (net, _) in cidrs {
-                            if net.is_single_host() {
-                                allowed_ips.insert(net.addr);
-                            }
-                        }
-                    }
-                }
+                let net_allow = if self.net_allow_is_active() {
+                    crate::network::NetRuleSet::from_resolved(&resolved_net_allow)
+                } else if !self.net_deny.is_empty() {
+                    // Deny-only policies are default-allow; net_deny still applies.
+                    crate::network::NetRuleSet::parse_literal(&["*:*", "icmp://*"])
+                        .expect("literal wildcard rules parse")
+                } else {
+                    crate::network::NetRuleSet::default()
+                };
                 let live = crate::policy_fn::LivePolicy {
-                    allowed_ips,
+                    net_approvable: net_allow.clone(),
+                    net_allow,
                     max_memory_bytes: notif_policy.max_memory_bytes,
                     max_processes: notif_policy.max_processes,
                 };
                 let ceiling = live.clone();
                 let live = std::sync::Arc::new(std::sync::RwLock::new(live));
                 let denied = policy_fn_state.denied.clone();
-                let pid_overrides = net_state.pid_ip_overrides.clone();
+                let pid_overrides = net_state.pid_net_overrides.clone();
                 policy_fn_state.live_policy = Some(live.clone());
                 let worker = crate::policy_fn::spawn_policy_fn(
                     policy_fn.callback.clone(),

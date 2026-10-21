@@ -297,9 +297,7 @@ fn finalize_deferred(action: NotifAction) -> NotifAction {
 // NetworkPolicy — network access policy enum
 // ============================================================
 
-/// Per-IP port allowlist. `Any` is used by `policy_fn` IP-only
-/// overrides (legacy `restrict_network(ips)` API where the user
-/// restricts the destination IP set but not ports).
+/// Ports permitted to an IP or range.
 #[derive(Debug, Clone)]
 pub enum PortAllow {
     /// Any port permitted to this IP.

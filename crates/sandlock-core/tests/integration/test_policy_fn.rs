@@ -1,7 +1,7 @@
-use sandlock_core::policy_fn::{PolicyFn, SyscallCategory, Verdict};
+use sandlock_core::policy_fn::{Permissions, PolicyFn, SyscallCategory, Verdict};
 use sandlock_core::sandbox::ByteSize;
 use sandlock_core::Sandbox;
-use std::net::{IpAddr, TcpListener};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -131,6 +131,7 @@ async fn test_policy_fn_deny_connect_does_not_leave_socket_connected() {
     listener.set_nonblocking(true).unwrap();
 
     let mut policy = base_policy()
+        .net_allow(format!("127.0.0.1:{port}"))
         .policy_fn(PolicyFn::new(|event, _ctx| {
             if event.syscall == "connect" {
                 Verdict::Deny
@@ -184,25 +185,23 @@ async fn test_policy_fn_deny_connect_does_not_leave_socket_connected() {
     );
 }
 
-/// restrict_network narrows outbound to the listed IPs and is enforced. The
-/// previous version called `restrict_network(&[])` — an empty list is a no-op —
-/// and connected to a dead port, so it verified nothing. Use two live loopback
-/// listeners (127.0.0.1 and 127.0.0.2), both allowlisted up front so either
-/// would connect; restricting to ["127.0.0.1"] must then permit the first and
-/// refuse the second (ECONNREFUSED, errno 111).
+/// restrict narrows outbound to the listed rules and is enforced. Two live
+/// loopback listeners are both allowlisted up front, so either would connect;
+/// restricting to 127.0.0.1 must permit the first and refuse the second
+/// (ECONNREFUSED, errno 111).
 #[tokio::test]
 async fn test_policy_fn_restrict_network_takes_effect() {
     let out = temp_file("restrict-net-effect");
     let (_l1, p1) = loopback_listener("127.0.0.1");
     let (_l2, p2) = loopback_listener("127.0.0.2");
 
-    let allowed: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap()];
     let policy = base_policy()
         .net_allow(format!("127.0.0.1:{p1}"))
         .net_allow(format!("127.0.0.2:{p2}"))
         .policy_fn(PolicyFn::new(move |event, ctx| {
             if event.syscall == "execve" {
-                ctx.restrict_network(&allowed); // narrow to 127.0.0.1
+                ctx.restrict(&Permissions::new().net_allow("127.0.0.1:*"))
+                    .unwrap();
             }
             Verdict::Allow
         }))
@@ -505,6 +504,7 @@ async fn test_policy_fn_network_events_only() {
     let denied_clone = denied.clone();
 
     let mut policy = base_policy()
+        .net_allow(format!("127.0.0.1:{port}"))
         .policy_fn(
             PolicyFn::new(move |event, ctx| {
                 if ctx.deny_path("/etc/hostname").is_ok() {
@@ -695,23 +695,19 @@ async fn test_policy_fn_audit() {
     );
 }
 
-/// restrict_pid_network blocks a pid's outbound even without a net_allow
-/// allowlist (policy_fn alone enables network interception). The previous
-/// version connected to a dead port and accepted any error, so it passed even
-/// if nothing was restricted. Target a *live* listener with no net_allow: the
-/// connect would succeed (network unrestricted by default under policy_fn), so
-/// the refusal can only come from restrict_pid_network([]).
+/// restrict_pid narrows one process below the live rules: the listener is
+/// allowlisted, so the refusal can only come from the per-process override.
 #[tokio::test]
-async fn test_policy_fn_restrict_pid_network_without_allowlist() {
+async fn test_policy_fn_restrict_pid_denies_connect() {
     let out = temp_file("restrict-pid-net");
     let (_listener, port) = loopback_listener("127.0.0.1");
 
-    // No net_allow: outbound is otherwise unrestricted; the callback restricts
-    // the exec'd pid's network to the empty set (deny all) on execve.
     let policy = base_policy()
+        .net_allow("127.0.0.1:*")
         .policy_fn(PolicyFn::new(move |event, ctx| {
             if event.syscall == "execve" {
-                ctx.restrict_pid_network(event.pid, &[]);
+                ctx.restrict_pid(event.pid, &Permissions::new().net_allow_none())
+                    .unwrap();
             }
             Verdict::Allow
         }))
@@ -746,7 +742,47 @@ async fn test_policy_fn_restrict_pid_network_without_allowlist() {
     // per-pid restriction.
     assert_eq!(
         content, "ERR111",
-        "restrict_pid_network([]) must deny the connect"
+        "restrict_pid with no rules must deny the connect"
+    );
+}
+
+/// With a policy_fn and no net_allow, nothing is reachable: the callback
+/// allowing every event must not open the network.
+#[tokio::test]
+async fn policy_fn_without_net_allow_denies_connect() {
+    let out = temp_file("policy-fn-no-net-allow");
+    let (listener, port) = loopback_listener("127.0.0.1");
+    listener.set_nonblocking(true).unwrap();
+
+    let mut policy = base_policy()
+        .policy_fn(PolicyFn::new(|_event, _ctx| Verdict::Allow))
+        .build()
+        .unwrap();
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('ERR%d' % e.errno)\n",
+        ),
+        port = port,
+        out = out.display()
+    );
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(content, "ERR111");
+    assert!(
+        listener.accept().is_err(),
+        "connect reached the listener without net_allow"
     );
 }
 

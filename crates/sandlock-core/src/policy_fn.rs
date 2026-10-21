@@ -167,12 +167,55 @@ impl SyscallEvent {
 /// that can be dynamically adjusted at runtime.
 #[derive(Debug, Clone)]
 pub struct LivePolicy {
-    /// Allowed destination IPs for outbound connections.
-    pub allowed_ips: HashSet<IpAddr>,
+    /// Destinations outbound connections and sends may reach now.
+    pub net_allow: NetRuleSet,
+    /// Destinations an approval may still open; always covers `net_allow`.
+    pub net_approvable: NetRuleSet,
     /// Maximum memory in bytes (0 = unlimited).
     pub max_memory_bytes: u64,
     /// Maximum concurrent processes (`u32::MAX` = unlimited).
     pub max_processes: u32,
+}
+
+pub use crate::network::NetRuleSet;
+
+/// Permissions in the `Sandbox` vocabulary, used to narrow live policy or to
+/// bound what approvals may open.
+#[derive(Debug, Clone, Default)]
+pub struct Permissions {
+    net_allow: Option<Vec<String>>,
+}
+
+impl Permissions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a `net_allow` spec, in the same syntax as
+    /// [`SandboxBuilder::net_allow`](crate::SandboxBuilder::net_allow).
+    pub fn net_allow(mut self, spec: impl Into<String>) -> Self {
+        self.net_allow
+            .get_or_insert_with(Vec::new)
+            .push(spec.into());
+        self
+    }
+
+    /// Name `net_allow` with no specs, which means no destination.
+    pub fn net_allow_none(mut self) -> Self {
+        self.net_allow.get_or_insert_with(Vec::new);
+        self
+    }
+
+    pub(crate) fn net_allow_specs(&self) -> Option<&[String]> {
+        self.net_allow.as_deref()
+    }
+
+    pub(crate) fn net_rules(&self) -> Result<NetRuleSet, PolicyFnError> {
+        let specs = self
+            .net_allow_specs()
+            .ok_or_else(|| PolicyFnError::Invalid("no permissions given".into()))?;
+        NetRuleSet::parse_literal(specs)
+    }
 }
 
 // ============================================================
@@ -189,7 +232,7 @@ pub struct PolicyContext {
     live: Arc<RwLock<LivePolicy>>,
     ceiling: LivePolicy,
     restricted: HashSet<&'static str>,
-    pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
+    pid_overrides: Arc<RwLock<HashMap<u32, NetRuleSet>>>,
     denied: Arc<crate::seccomp::state::DeniedSet>,
     events: CategorySet,
 }
@@ -198,7 +241,7 @@ impl PolicyContext {
     pub(crate) fn new(
         live: Arc<RwLock<LivePolicy>>,
         ceiling: LivePolicy,
-        pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
+        pid_overrides: Arc<RwLock<HashMap<u32, NetRuleSet>>>,
         denied: Arc<crate::seccomp::state::DeniedSet>,
     ) -> Self {
         Self {
@@ -226,24 +269,7 @@ impl PolicyContext {
         self.live.read().unwrap().clone()
     }
 
-    /// Maximum permissions (immutable ceiling).
-    pub fn ceiling(&self) -> &LivePolicy {
-        &self.ceiling
-    }
-
     // ---- Grant (expand within ceiling) ----
-
-    /// Expand allowed IPs. Cannot exceed ceiling. Fails if restricted.
-    pub fn grant_network(&mut self, ips: &[IpAddr]) -> Result<(), PolicyFnError> {
-        self.check_not_restricted("allowed_ips")?;
-        let mut live = self.live.write().unwrap();
-        for ip in ips {
-            if self.ceiling.allowed_ips.contains(ip) {
-                live.allowed_ips.insert(*ip);
-            }
-        }
-        Ok(())
-    }
 
     /// Expand max memory. Cannot exceed ceiling. Fails if restricted.
     pub fn grant_max_memory(&mut self, bytes: u64) -> Result<(), PolicyFnError> {
@@ -263,11 +289,13 @@ impl PolicyContext {
 
     // ---- Restrict (permanent shrink) ----
 
-    /// Permanently restrict allowed IPs. Cannot be granted back.
-    pub fn restrict_network(&mut self, ips: &[IpAddr]) {
-        self.restricted.insert("allowed_ips");
+    /// Permanently narrow live and approvable network rules to `p`.
+    pub fn restrict(&mut self, p: &Permissions) -> Result<(), PolicyFnError> {
+        let rules = p.net_rules()?;
         let mut live = self.live.write().unwrap();
-        live.allowed_ips = ips.iter().copied().collect();
+        live.net_allow = live.net_allow.intersect(&rules);
+        live.net_approvable = live.net_approvable.intersect(&rules);
+        Ok(())
     }
 
     /// Permanently restrict max memory. Cannot be granted back.
@@ -286,10 +314,11 @@ impl PolicyContext {
 
     // ---- Per-PID overrides ----
 
-    /// Restrict network for a specific PID (tighter than global policy).
-    pub fn restrict_pid_network(&self, pid: u32, ips: &[IpAddr]) {
-        let mut overrides = self.pid_overrides.write().unwrap();
-        overrides.insert(pid, ips.iter().copied().collect());
+    /// Narrow one process's network below the live policy.
+    pub fn restrict_pid(&self, pid: u32, p: &Permissions) -> Result<(), PolicyFnError> {
+        let rules = p.net_rules()?;
+        self.pid_overrides.write().unwrap().insert(pid, rules);
+        Ok(())
     }
 
     /// Remove per-PID override, falling back to global policy.
@@ -552,7 +581,7 @@ pub(crate) fn spawn_policy_fn(
     callback: PolicyCallback,
     live: Arc<RwLock<LivePolicy>>,
     ceiling: LivePolicy,
-    pid_overrides: Arc<RwLock<HashMap<u32, HashSet<IpAddr>>>>,
+    pid_overrides: Arc<RwLock<HashMap<u32, NetRuleSet>>>,
     denied: Arc<crate::seccomp::state::DeniedSet>,
     events: CategorySet,
 ) -> PolicyFnWorker {
@@ -877,104 +906,93 @@ mod tests {
         assert_eq!(first_rx.blocking_recv(), Ok(Verdict::Allow));
     }
 
+    fn rules(specs: &[&str]) -> NetRuleSet {
+        NetRuleSet::parse_literal(specs).unwrap()
+    }
+
     fn test_live() -> LivePolicy {
         LivePolicy {
-            allowed_ips: ["127.0.0.1", "10.0.0.1"]
-                .iter()
-                .map(|s| s.parse().unwrap())
-                .collect(),
+            net_allow: rules(&["127.0.0.1:*", "10.0.0.1:*"]),
+            net_approvable: rules(&["*:*"]),
             max_memory_bytes: 1024 * 1024 * 1024,
             max_processes: 64,
         }
     }
 
-    #[test]
-    fn test_grant_within_ceiling() {
-        let live = Arc::new(RwLock::new(LivePolicy {
-            allowed_ips: HashSet::new(),
-            max_memory_bytes: 0,
-            max_processes: 0,
-        }));
-        let ceiling = test_live();
-        let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
-
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        ctx.grant_network(&[ip]).unwrap();
-        assert!(live.read().unwrap().allowed_ips.contains(&ip));
+    fn test_ctx(live: &Arc<RwLock<LivePolicy>>) -> PolicyContext {
+        PolicyContext::new(
+            live.clone(),
+            test_live(),
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(crate::seccomp::state::DeniedSet::default()),
+        )
     }
 
     #[test]
-    fn test_grant_capped_to_ceiling() {
-        let live = Arc::new(RwLock::new(LivePolicy {
-            allowed_ips: HashSet::new(),
-            max_memory_bytes: 0,
-            max_processes: 0,
-        }));
-        let ceiling = test_live();
-        let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
-
-        // Try to grant an IP not in ceiling — should be silently ignored
-        let foreign: IpAddr = "8.8.8.8".parse().unwrap();
-        ctx.grant_network(&[foreign]).unwrap();
-        assert!(!live.read().unwrap().allowed_ips.contains(&foreign));
-    }
-
-    #[test]
-    fn test_restrict_then_grant_fails() {
+    fn restrict_narrows_live_and_approvable() {
         let live = Arc::new(RwLock::new(test_live()));
-        let ceiling = test_live();
-        let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live, ceiling, pid_overrides, denied);
+        let mut ctx = test_ctx(&live);
+        ctx.restrict(&Permissions::new().net_allow("127.0.0.1:443"))
+            .unwrap();
+        let live = live.read().unwrap();
+        assert_eq!(live.net_allow, rules(&["127.0.0.1:443"]));
+        assert_eq!(live.net_approvable, rules(&["127.0.0.1:443"]));
+    }
 
-        ctx.restrict_network(&[]);
-        let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        assert!(ctx.grant_network(&[ip]).is_err());
+    #[test]
+    fn restrict_to_none_denies_everything() {
+        let live = Arc::new(RwLock::new(test_live()));
+        let mut ctx = test_ctx(&live);
+        ctx.restrict(&Permissions::new().net_allow_none()).unwrap();
+        assert!(live.read().unwrap().net_allow.is_empty());
+        assert!(live.read().unwrap().net_approvable.is_empty());
+    }
+
+    #[test]
+    fn restrict_rejects_hostname() {
+        let live = Arc::new(RwLock::new(test_live()));
+        let mut ctx = test_ctx(&live);
+        assert!(matches!(
+            ctx.restrict(&Permissions::new().net_allow("example.com:443")),
+            Err(PolicyFnError::Invalid(_))
+        ));
+        assert_eq!(live.read().unwrap().net_allow, test_live().net_allow);
+    }
+
+    #[test]
+    fn restrict_rejects_empty() {
+        let live = Arc::new(RwLock::new(test_live()));
+        let mut ctx = test_ctx(&live);
+        assert!(matches!(
+            ctx.restrict(&Permissions::new()),
+            Err(PolicyFnError::Invalid(_))
+        ));
     }
 
     #[test]
     fn test_restrict_max_memory() {
         let live = Arc::new(RwLock::new(test_live()));
-        let ceiling = test_live();
-        let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let mut ctx = PolicyContext::new(live.clone(), ceiling, pid_overrides, denied);
-
+        let mut ctx = test_ctx(&live);
         ctx.restrict_max_memory(256 * 1024 * 1024);
         assert_eq!(live.read().unwrap().max_memory_bytes, 256 * 1024 * 1024);
     }
 
     #[test]
-    fn test_pid_override() {
+    fn restrict_pid_records_override() {
         let live = Arc::new(RwLock::new(test_live()));
-        let ceiling = test_live();
         let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied);
-
-        let localhost: IpAddr = "127.0.0.1".parse().unwrap();
-        ctx.restrict_pid_network(1234, &[localhost]);
-
-        let overrides = pid_overrides.read().unwrap();
-        let pid_ips = overrides.get(&1234).unwrap();
-        assert!(pid_ips.contains(&localhost));
-        assert_eq!(pid_ips.len(), 1);
-    }
-
-    #[test]
-    fn test_clear_pid_override() {
-        let live = Arc::new(RwLock::new(test_live()));
-        let ceiling = test_live();
-        let pid_overrides = Arc::new(RwLock::new(HashMap::new()));
-        let denied = Arc::new(crate::seccomp::state::DeniedSet::default());
-        let ctx = PolicyContext::new(live, ceiling, pid_overrides.clone(), denied);
-
-        let localhost: IpAddr = "127.0.0.1".parse().unwrap();
-        ctx.restrict_pid_network(1234, &[localhost]);
+        let ctx = PolicyContext::new(
+            live,
+            test_live(),
+            pid_overrides.clone(),
+            Arc::new(crate::seccomp::state::DeniedSet::default()),
+        );
+        ctx.restrict_pid(1234, &Permissions::new().net_allow("127.0.0.1:*"))
+            .unwrap();
+        assert_eq!(
+            pid_overrides.read().unwrap().get(&1234),
+            Some(&rules(&["127.0.0.1:*"]))
+        );
         ctx.clear_pid_override(1234);
         assert!(!pid_overrides.read().unwrap().contains_key(&1234));
     }

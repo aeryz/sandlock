@@ -39,11 +39,8 @@ pub(crate) fn destination_verdict(
 }
 
 /// Resolve order: effective allow first, then the immutable static deny.
-/// Allow already carries legacy dynamic resolution (per-PID override > live
-/// policy > static per-protocol allowlist). Deny is always the static
-/// per-protocol denylist and wins second, including when the effective allow
-/// is `Unrestricted` or comes from a `policy_fn`/per-PID override. No
-/// dynamic/static allow intersection is performed.
+/// Deny is always the static per-protocol denylist and wins second, including
+/// when the effective allow is `Unrestricted` or comes from a `policy_fn`.
 pub(crate) fn layered_destination_verdict(
     effective: &NetworkPolicyLayers,
     ip: IpAddr,

@@ -2571,51 +2571,56 @@ pub unsafe extern "C" fn sandlock_ctx_is_cancelled(ctx: *const sandlock_ctx_t) -
     ctx.is_null() || (*(*ctx).ctx).is_cancelled()
 }
 
-/// Restrict network to the given IPs. Permanent — cannot grant back.
+/// Collect `count` C strings as the `net_allow` of a `Permissions`; `count`
+/// zero names no destination.
+unsafe fn net_allow_permissions(
+    specs: *const *const c_char,
+    count: u32,
+) -> Result<sandlock_core::policy_fn::Permissions, i32> {
+    let mut p = sandlock_core::policy_fn::Permissions::new().net_allow_none();
+    if count > 0 && specs.is_null() {
+        return Err(-libc::EINVAL);
+    }
+    for i in 0..count as usize {
+        let spec = *specs.add(i);
+        if spec.is_null() {
+            return Err(-libc::EINVAL);
+        }
+        let spec = CStr::from_ptr(spec).to_str().map_err(|_| -libc::EINVAL)?;
+        p = p.net_allow(spec);
+    }
+    Ok(p)
+}
+
+fn policy_fn_errno(e: &sandlock_core::policy_fn::PolicyFnError) -> i32 {
+    match e {
+        sandlock_core::policy_fn::PolicyFnError::NotApprovable(_) => -libc::EPERM,
+        _ => -libc::EINVAL,
+    }
+}
+
+/// Permanently narrow live and approvable network rules to `specs`, in
+/// `net_allow` syntax without hostnames. Returns 0 or `-EINVAL`.
 ///
 /// # Safety
 /// `ctx` must be a valid context pointer from inside a policy callback.
-/// `ips` must point to `count` valid C strings.
+/// `specs` must point to `count` valid C strings.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_restrict_network(
+pub unsafe extern "C" fn sandlock_ctx_restrict_net_allow(
     ctx: *mut sandlock_ctx_t,
-    ips: *const *const c_char,
+    specs: *const *const c_char,
     count: u32,
-) {
+) -> c_int {
     if ctx.is_null() {
-        return;
+        return -libc::EINVAL;
     }
     let ctx = &mut *(*ctx).ctx;
-    let parsed: Vec<std::net::IpAddr> = (0..count as usize)
-        .filter_map(|i| {
-            let s = CStr::from_ptr(*ips.add(i)).to_str().ok()?;
-            s.parse().ok()
-        })
-        .collect();
-    ctx.restrict_network(&parsed);
-}
-
-/// Grant network IPs (within ceiling). Fails silently if restricted.
-///
-/// # Safety
-/// Same as `sandlock_ctx_restrict_network`.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_grant_network(
-    ctx: *mut sandlock_ctx_t,
-    ips: *const *const c_char,
-    count: u32,
-) {
-    if ctx.is_null() {
-        return;
+    match net_allow_permissions(specs, count)
+        .and_then(|p| ctx.restrict(&p).map_err(|e| policy_fn_errno(&e)))
+    {
+        Ok(()) => 0,
+        Err(e) => e,
     }
-    let ctx = &mut *(*ctx).ctx;
-    let parsed: Vec<std::net::IpAddr> = (0..count as usize)
-        .filter_map(|i| {
-            let s = CStr::from_ptr(*ips.add(i)).to_str().ok()?;
-            s.parse().ok()
-        })
-        .collect();
-    let _ = ctx.grant_network(&parsed);
 }
 
 /// Restrict max memory. Permanent.
@@ -2644,28 +2649,29 @@ pub unsafe extern "C" fn sandlock_ctx_restrict_max_processes(ctx: *mut sandlock_
     ctx.restrict_max_processes(n);
 }
 
-/// Restrict network for a specific PID.
+/// Narrow one process's network to `specs` on top of the live rules.
+/// Returns 0 or `-EINVAL`.
 ///
 /// # Safety
-/// `ctx` must be a valid context pointer. `ips` must point to `count` C strings.
+/// `ctx` must be a valid context pointer from inside a policy callback.
+/// `specs` must point to `count` valid C strings.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_restrict_pid_network(
+pub unsafe extern "C" fn sandlock_ctx_restrict_pid_net_allow(
     ctx: *mut sandlock_ctx_t,
     pid: u32,
-    ips: *const *const c_char,
+    specs: *const *const c_char,
     count: u32,
-) {
+) -> c_int {
     if ctx.is_null() {
-        return;
+        return -libc::EINVAL;
     }
-    let ctx = &mut *(*ctx).ctx;
-    let parsed: Vec<std::net::IpAddr> = (0..count as usize)
-        .filter_map(|i| {
-            let s = CStr::from_ptr(*ips.add(i)).to_str().ok()?;
-            s.parse().ok()
-        })
-        .collect();
-    ctx.restrict_pid_network(pid, &parsed);
+    let ctx = &*(*ctx).ctx;
+    match net_allow_permissions(specs, count)
+        .and_then(|p| ctx.restrict_pid(pid, &p).map_err(|e| policy_fn_errno(&e)))
+    {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }
 
 /// Deny access to a path dynamically (checked on openat). Returns 0, or -1

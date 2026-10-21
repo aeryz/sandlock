@@ -1313,21 +1313,14 @@ void sandlock_approval_free(sandlock_approval_t *approval);
 bool sandlock_ctx_is_cancelled(const sandlock_ctx_t *ctx);
 
 /**
- * Restrict network to the given IPs. Permanent — cannot grant back.
+ * Permanently narrow live and approvable network rules to `specs`, in
+ * `net_allow` syntax without hostnames. Returns 0 or `-EINVAL`.
  *
  * # Safety
  * `ctx` must be a valid context pointer from inside a policy callback.
- * `ips` must point to `count` valid C strings.
+ * `specs` must point to `count` valid C strings.
  */
-void sandlock_ctx_restrict_network(sandlock_ctx_t *ctx, const char *const *ips, uint32_t count);
-
-/**
- * Grant network IPs (within ceiling). Fails silently if restricted.
- *
- * # Safety
- * Same as `sandlock_ctx_restrict_network`.
- */
-void sandlock_ctx_grant_network(sandlock_ctx_t *ctx, const char *const *ips, uint32_t count);
+int sandlock_ctx_restrict_net_allow(sandlock_ctx_t *ctx, const char *const *specs, uint32_t count);
 
 /**
  * Restrict max memory. Permanent.
@@ -1346,15 +1339,17 @@ void sandlock_ctx_restrict_max_memory(sandlock_ctx_t *ctx, uint64_t bytes);
 void sandlock_ctx_restrict_max_processes(sandlock_ctx_t *ctx, uint32_t n);
 
 /**
- * Restrict network for a specific PID.
+ * Narrow one process's network to `specs` on top of the live rules.
+ * Returns 0 or `-EINVAL`.
  *
  * # Safety
- * `ctx` must be a valid context pointer. `ips` must point to `count` C strings.
+ * `ctx` must be a valid context pointer from inside a policy callback.
+ * `specs` must point to `count` valid C strings.
  */
-void sandlock_ctx_restrict_pid_network(sandlock_ctx_t *ctx,
-                                       uint32_t pid,
-                                       const char *const *ips,
-                                       uint32_t count);
+int sandlock_ctx_restrict_pid_net_allow(sandlock_ctx_t *ctx,
+                                        uint32_t pid,
+                                        const char *const *specs,
+                                        uint32_t count);
 
 /**
  * Deny access to a path dynamically (checked on openat). Returns 0, or -1
