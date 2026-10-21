@@ -231,6 +231,7 @@ func Allow() PolicyDecision
 func Deny() PolicyDecision
 func Audit() PolicyDecision
 func DenyWith(errnoValue int) PolicyDecision
+func Grant(p Permissions) PolicyDecision
 
 func (e SyscallEvent) ArgvContains(sub string) bool
 
@@ -240,11 +241,9 @@ func (ctx *PolicyContext) RestrictMaxProcesses(n uint32)
 func (ctx *PolicyContext) RestrictPID(pid uint32, p Permissions) error
 func (ctx *PolicyContext) DenyPath(path string) error
 func (ctx *PolicyContext) AllowPath(path string) error
-
-func (a *Approval) AllowWith(p Permissions) error
 ```
 
-`PolicyFn.Approvable` bounds what `AllowWith` may grant; see
+`PolicyFn.Approvable` bounds what `Grant` may open; see
 [approve network on demand](../docs/policy-fn.md#approve-network-on-demand).
 
 `PolicyFn.Callback` receives dynamic syscall events from sandlock's policy-fn worker

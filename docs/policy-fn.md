@@ -44,7 +44,9 @@ result = sandbox.run(["python3", "agent.py"])
 ```
 
 **Verdicts:** `0`/`False` = allow, `True`/`-1` = deny (EPERM),
-positive int = deny with errno, `"audit"`/`-2` = allow + flag.
+positive int = deny with errno, `"audit"`/`-2` = allow + flag,
+`Grant(net_allow=[...])` = widen the network, then allow (see
+[Approve network on demand](#approve-network-on-demand)).
 
 **Event fields:** `syscall`, `category` (filesystem/network/process),
 `pid`, `parent_pid`, `host`, `port`, `argv`, `denied`.
@@ -215,33 +217,34 @@ value.
 A sandbox can start with no network and open it when a person says yes.
 `net_allow` is what the sandbox may reach at launch; `PolicyFn.approvable`
 is the most an approval may ever add on top. A connect or send to a
-destination inside `approvable` but not yet allowed is held for the callback,
-and `approval.allow(net_allow=...)` grants those rules for good and then lets
-the held operation through.
+destination inside `approvable` but not yet allowed is held for the callback.
+Answering with a `Grant` widens the live rules for good and then lets the held
+operation through; it is a verdict like any other, so a synchronous callback
+returns it and a deferred one resolves its approval with it.
 
 ```python
-import threading
-from sandlock import Sandbox, PolicyFn, Permissions
+import errno
+from sandlock import Sandbox, PolicyFn, Permissions, Grant
 
-def on_event(event, ctx, approval):
-    if approval is None:
-        return
-    def decide():
-        if ask_human(f"{event.host}:{event.port}?"):
-            approval.allow(net_allow=["*:*"])   # grant, then let this connect through
-        else:
-            approval.deny()
-    threading.Thread(target=decide).start()
+def on_event(event, ctx):
+    if event.syscall != "connect":
+        return 0
+    if ask_human(f"{event.host}:{event.port}?"):
+        return Grant(net_allow=["*:*"])   # widen for good, then allow this one
+    return errno.ECONNREFUSED
 
 sandbox = Sandbox(
     net_deny=["169.254.169.254"],
     policy_fn=PolicyFn(
         on_event,
-        deferred=True,
         events={"network"},
+        verdict_timeout=None,
         approvable=Permissions(net_allow=["*:*"]),
     ),
 )
+
+# a deferred callback answers the same way, from any thread
+approval.resolve(Grant(net_allow=["*:*"]))
 ```
 
 Each destination falls in one class:
@@ -250,24 +253,26 @@ Each destination falls in one class:
 |---|---|---|
 | denied | matches `net_deny` | refused; no grant can open it |
 | allowed | inside the live rules (`net_allow` plus grants) | runs, still reported to a network callback |
-| held | inside `approvable`, outside the live rules | waits for the approval; a plain `allow()` lets this one through without granting |
+| held | inside `approvable`, outside the live rules | waits for the verdict; a plain allow lets this one through without granting |
 | rejected | outside `approvable` | refused with `ECONNREFUSED`; the callback still sees it but cannot grant it |
 
-A grant outside `approvable`, or after `ctx.restrict()` narrowed it, fails
-without answering the approval (Python raises `PermissionError`, Go returns
-`ErrNotApprovable`, C returns `-EPERM`), so the caller can still deny. A held
+A grant outside `approvable`, or after `ctx.restrict()` narrowed it, denies the
+operation and changes nothing. A returned grant is logged; resolving an
+approval with one also reports it (Python raises `PermissionError`, Go returns
+`ErrNotApprovable`, Rust `try_resolve` returns `PolicyFnError::NotApprovable`,
+C returns `-EPERM`). A held
 operation that times out or is closed is refused with `ECONNREFUSED`. As in
 `net_allow`, `*:*` covers TCP and UDP but not ICMP; add `icmp://*` to approve
 pings. A `policy_fn` with neither `net_allow` nor `approvable` reaches no
 network. Approvable rules need a callback subscribed to network events, since
 only it can answer a held operation; building fails otherwise.
 
-| API | Approvable rules | Grant and allow |
+| API | Approvable rules | Grant verdict |
 |---|---|---|
-| Python | `PolicyFn(cb, approvable=Permissions(net_allow=[...]))` | `approval.allow(net_allow=[...])` |
-| Rust | `PolicyFn::deferred(cb).approvable(Permissions::new().net_allow(..))` | `approval.allow_with(&permissions)` |
-| Go | `PolicyFn{Approvable: &sandlock.Permissions{NetAllow: ...}}` | `approval.AllowWith(sandlock.Permissions{...})` |
-| C | `sandlock_sandbox_builder_approvable_net_allow` | `sandlock_approval_allow_net_allow` |
+| Python | `PolicyFn(cb, approvable=Permissions(net_allow=[...]))` | `Grant(net_allow=[...])` |
+| Rust | `PolicyFn::new(cb).approvable(Permissions::new().net_allow(..))` | `Verdict::Grant(permissions)` |
+| Go | `PolicyFn{Approvable: &sandlock.Permissions{NetAllow: ...}}` | `sandlock.Grant(sandlock.Permissions{...})` |
+| C | `sandlock_sandbox_builder_approvable_net_allow` | `sandlock_approval_grant_net_allow` (deferred callbacks) |
 
 ## Interaction with static rules
 
