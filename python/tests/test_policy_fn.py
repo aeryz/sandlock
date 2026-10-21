@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from sandlock import Sandbox, PolicyFn, Permissions, SyscallEvent, PolicyContext
+from sandlock import Sandbox, PolicyFn, Permissions, Grant, SyscallEvent, PolicyContext
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -660,35 +660,43 @@ def _run_approvable(answer, approvable=("127.0.0.1:*",)):
 
 
 def test_approval_grants_network_from_thread():
-    assert _run_approvable(lambda a: a.allow(net_allow=["127.0.0.1:*"])) == "OK OK"
+    assert _run_approvable(lambda a: a.resolve(Grant(net_allow=["127.0.0.1:*"]))) == "OK OK"
 
 
-def test_approval_allow_outside_approvable_raises():
+def _refused_grant(grant, error):
     errors = []
 
     def answer(approval):
         try:
-            approval.allow(net_allow=["10.0.0.0/8:*"])
-        except PermissionError as e:
+            approval.resolve(grant)
+        except error as e:
             errors.append(e)
-            approval.deny()
 
     assert _run_approvable(answer) == "ERR111 ERR111"
     assert len(errors) == 2
 
 
-def test_approval_allow_rejects_hostname():
-    errors = []
+def test_grant_outside_approvable_denies_and_raises():
+    _refused_grant(Grant(net_allow=["10.0.0.0/8:*"]), PermissionError)
 
-    def answer(approval):
-        try:
-            approval.allow(net_allow=["example.com:443"])
-        except ValueError as e:
-            errors.append(e)
-            approval.allow()
 
-    assert _run_approvable(answer) == "OK OK"
-    assert len(errors) == 2
+def test_grant_hostname_denies_and_raises():
+    _refused_grant(Grant(net_allow=["example.com:443"]), ValueError)
+
+
+def test_sync_callback_returns_grant():
+    def on_event(event, ctx):
+        if event.syscall == "connect":
+            return Grant(net_allow=["127.0.0.1:*"])
+        return 0
+
+    with _loopback_listener("127.0.0.1") as (_, port):
+        result = _policy(policy_fn=PolicyFn(
+            on_event, events={"network"},
+            approvable=Permissions(net_allow=["127.0.0.1:*"]),
+        )).run([sys.executable, "-c", _CONNECT_TWICE, str(port)])
+    assert result.success, result.error
+    assert result.stdout.decode().strip() == "OK OK"
 
 
 def test_policy_fn_without_net_allow_denies_connect():

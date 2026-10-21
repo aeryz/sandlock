@@ -203,6 +203,12 @@ class Permissions:
         object.__setattr__(self, "net_allow", tuple(self.net_allow))
 
 
+@dataclass(frozen=True, kw_only=True)
+class Grant(Permissions):
+    """A verdict that widens the live rules for good, within
+    ``PolicyFn.approvable``, then allows. Hostnames are not accepted."""
+
+
 @dataclass(frozen=True)
 class PolicyFn:
     """A policy callback and the timeout for its held verdicts."""

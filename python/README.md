@@ -716,8 +716,8 @@ Methods available inside `policy_fn`:
 | `ctx.deny_path(path)` | Deny access to a path |
 | `ctx.allow_path(path)` | Remove a previously denied path |
 
-Runtime specs take IPs and CIDRs only. Widening the network happens through
-`approval.allow(net_allow=specs)` within `PolicyFn(approvable=Permissions(...))`;
+Runtime specs take IPs and CIDRs only. Widening the network happens by
+answering with `Grant(net_allow=specs)` within `PolicyFn(approvable=Permissions(...))`;
 see [approve network on demand](../docs/policy-fn.md#approve-network-on-demand).
 The static `net_deny` layer is checked after the allow verdict and always wins.
 
@@ -729,6 +729,7 @@ Callback return values:
 | `True`, `-1` | Deny (EPERM) |
 | positive `int` | Deny with that errno |
 | `"audit"`, `-2` | Allow but flag for audit |
+| `Grant(net_allow=specs)` | Widen the network within `approvable`, then allow |
 
 ### Fork
 

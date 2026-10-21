@@ -15,7 +15,7 @@ from ._sdk import (
 from .inputs import inputs
 from .handler import Handler, NotifAction, HandlerCtx, ExceptionPolicy
 from .sandbox import (
-    Sandbox, PolicyFn, Permissions, BranchAction, parse_ports, Change, Entry, renames, StdioMode, Process,
+    Sandbox, PolicyFn, Permissions, Grant, BranchAction, parse_ports, Change, Entry, renames, StdioMode, Process,
     Image, ImageConfig,
 )
 from ._profile import load_profile, list_profiles
@@ -40,6 +40,7 @@ __all__ = [
     "Sandbox",
     "PolicyFn",
     "Permissions",
+    "Grant",
     "Image",
     "ImageConfig",
     "pull_image",
