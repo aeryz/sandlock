@@ -181,6 +181,16 @@ type PolicyFn struct {
 	// Events limits delivery to these categories; empty means all. Syscalls
 	// outside them are not intercepted for the callback.
 	Events []SyscallCategory
+	// Approvable is the most an approval may open beyond NetAllow.
+	// Destinations here but not yet allowed are held for the callback.
+	Approvable *Permissions
+}
+
+// Permissions are rules in the Sandbox vocabulary.
+type Permissions struct {
+	// NetAllow uses Sandbox.NetAllow syntax. Runtime calls reject hostnames;
+	// an empty list means no destination.
+	NetAllow []string
 }
 
 // Protection identifies a single Landlock protection whose enforcement

@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1048,6 +1049,7 @@ func TestPolicyFnNetworkEventsOnly(t *testing.T) {
 	var denyErrs []error
 	sb := &sandlock.Sandbox{
 		FSReadable: rootfs,
+		NetAllow:   []string{fmt.Sprintf("127.0.0.1:%d", port)},
 		PolicyFn: &sandlock.PolicyFn{
 			Events: []sandlock.SyscallCategory{sandlock.CategoryNetwork},
 			Callback: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
@@ -1087,6 +1089,76 @@ socket.create_connection(('127.0.0.1', %d)).close()
 	}
 	if !connected {
 		t.Fatal("connect event missing")
+	}
+}
+
+func runApprovedConnect(t *testing.T, grant []string) (bool, error) {
+	t.Helper()
+	requireLandlock(t)
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("python3 not available")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	if grant == nil {
+		grant = []string{fmt.Sprintf("127.0.0.1:%d", port)}
+	}
+
+	var mu sync.Mutex
+	var grantErr error
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: &sandlock.PolicyFn{
+			Approvable: &sandlock.Permissions{NetAllow: []string{"127.0.0.1:*"}},
+			Deferred: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext, approval *sandlock.Approval) {
+				if approval == nil {
+					return
+				}
+				if event.Syscall != "connect" {
+					_ = approval.Resolve(sandlock.Allow())
+					return
+				}
+				err := approval.AllowWith(sandlock.Permissions{NetAllow: grant})
+				if err != nil {
+					_ = approval.Resolve(sandlock.DenyWith(int(syscall.ECONNREFUSED)))
+				}
+				mu.Lock()
+				grantErr = err
+				mu.Unlock()
+			},
+		},
+	}
+	script := fmt.Sprintf("import socket; socket.create_connection(('127.0.0.1', %d)).close()", port)
+	res, err := sb.Run(context.Background(), "python3", "-c", script)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return res.Success, grantErr
+}
+
+func TestApprovalAllowWithGrantsNetwork(t *testing.T) {
+	ok, err := runApprovedConnect(t, nil)
+	if err != nil {
+		t.Fatalf("AllowWith: %v", err)
+	}
+	if !ok {
+		t.Fatal("granted connect must succeed")
+	}
+}
+
+func TestApprovalAllowWithOutsideApprovable(t *testing.T) {
+	ok, err := runApprovedConnect(t, []string{"10.0.0.1:443"})
+	if !errors.Is(err, sandlock.ErrNotApprovable) {
+		t.Fatalf("AllowWith = %v, want ErrNotApprovable", err)
+	}
+	if ok {
+		t.Fatal("connect must stay refused")
 	}
 }
 
