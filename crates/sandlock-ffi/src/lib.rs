@@ -2283,7 +2283,7 @@ pub type sandlock_policy_ud_drop_t = unsafe extern "C" fn(user_data: *mut c_void
 /// A held syscall's pending verdict, owned by the C caller.
 #[allow(non_camel_case_types)]
 pub struct sandlock_approval_t {
-    approval: sandlock_core::policy_fn::Approval,
+    approval: Option<sandlock_core::policy_fn::Approval>,
 }
 
 /// C callback type for a deferred policy_fn.
@@ -2503,7 +2503,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
                       ctx: &mut sandlock_core::policy_fn::PolicyContext,
                       approval: Option<sandlock_core::policy_fn::Approval>| {
         let approval = approval.map_or(ptr::null_mut(), |approval| {
-            Box::into_raw(Box::new(sandlock_approval_t { approval }))
+            Box::into_raw(Box::new(sandlock_approval_t {
+                approval: Some(approval),
+            }))
         });
         with_c_event(&event, |c_event| {
             let mut c_ctx = sandlock_ctx_t { ctx: ctx as *mut _ };
@@ -2521,6 +2523,70 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
     Box::into_raw(Box::new(builder.policy_fn(policy_fn)))
 }
 
+/// Set the rules approvals may open beyond `net_allow`, replacing any set
+/// earlier. Must follow `sandlock_sandbox_builder_policy_fn` or its deferred
+/// variant; without a policy callback it has no effect. Specs are validated
+/// when the policy is built.
+///
+/// # Safety
+/// `b` must be a valid builder pointer. `specs` must point to `count` valid
+/// C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_approvable_net_allow(
+    b: *mut SandboxBuilder,
+    specs: *const *const c_char,
+    count: u32,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let mut builder = *Box::from_raw(b);
+    if let (Some(pf), Ok(p)) = (
+        builder.policy_fn.take(),
+        net_allow_permissions(specs, count),
+    ) {
+        builder.policy_fn = Some(pf.approvable(p));
+    }
+    Box::into_raw(Box::new(builder))
+}
+
+/// Grant `specs` (`net_allow` syntax, no hostnames) within the approvable
+/// rules, then allow and free the approval. Returns 0, `-EPERM` when a spec
+/// is outside the approvable rules, or `-EINVAL`; on failure the approval
+/// stays live and unanswered.
+///
+/// # Safety
+/// `approval` must be a live approval. `specs` must point to `count` valid
+/// C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_approval_allow_net_allow(
+    approval: *mut sandlock_approval_t,
+    specs: *const *const c_char,
+    count: u32,
+) -> c_int {
+    if approval.is_null() {
+        return -libc::EINVAL;
+    }
+    let p = match net_allow_permissions(specs, count) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let slot = &mut (*approval).approval;
+    let Some(a) = slot.take() else {
+        return -libc::EINVAL;
+    };
+    match a.allow_with(&p) {
+        Ok(()) => {
+            drop(Box::from_raw(approval));
+            0
+        }
+        Err((a, e)) => {
+            *slot = Some(a);
+            policy_fn_errno(&e)
+        }
+    }
+}
+
 /// Resolve and free an approval. `verdict` uses the policy callback's return
 /// encoding.
 ///
@@ -2532,9 +2598,9 @@ pub unsafe extern "C" fn sandlock_approval_resolve(
     verdict: i32,
 ) {
     if !approval.is_null() {
-        Box::from_raw(approval)
-            .approval
-            .resolve(policy_ret_to_verdict(verdict));
+        if let Some(a) = Box::from_raw(approval).approval {
+            a.resolve(policy_ret_to_verdict(verdict));
+        }
     }
 }
 
@@ -2547,7 +2613,11 @@ pub unsafe extern "C" fn sandlock_approval_resolve(
 pub unsafe extern "C" fn sandlock_approval_is_cancelled(
     approval: *const sandlock_approval_t,
 ) -> bool {
-    approval.is_null() || (*approval).approval.is_cancelled()
+    approval.is_null()
+        || (*approval)
+            .approval
+            .as_ref()
+            .map_or(true, |a| a.is_cancelled())
 }
 
 /// Free an approval without resolving it, which denies the syscall.

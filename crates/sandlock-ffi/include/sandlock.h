@@ -1278,6 +1278,34 @@ sandlock_builder_t *sandlock_sandbox_builder_policy_fn_deferred(sandlock_builder
                                                                 void (*user_data_drop)(void *user_data));
 
 /**
+ * Set the rules approvals may open beyond `net_allow`, replacing any set
+ * earlier. Must follow `sandlock_sandbox_builder_policy_fn` or its deferred
+ * variant; without a policy callback it has no effect. Specs are validated
+ * when the policy is built.
+ *
+ * # Safety
+ * `b` must be a valid builder pointer. `specs` must point to `count` valid
+ * C strings.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_approvable_net_allow(sandlock_builder_t *b,
+                                                                  const char *const *specs,
+                                                                  uint32_t count);
+
+/**
+ * Grant `specs` (`net_allow` syntax, no hostnames) within the approvable
+ * rules, then allow and free the approval. Returns 0, `-EPERM` when a spec
+ * is outside the approvable rules, or `-EINVAL`; on failure the approval
+ * stays live and unanswered.
+ *
+ * # Safety
+ * `approval` must be a live approval. `specs` must point to `count` valid
+ * C strings.
+ */
+int sandlock_approval_allow_net_allow(sandlock_approval_t *approval,
+                                      const char *const *specs,
+                                      uint32_t count);
+
+/**
  * Resolve and free an approval. `verdict` uses the policy callback's return
  * encoding.
  *
