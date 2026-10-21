@@ -449,6 +449,9 @@ pub struct PolicyFn {
     pub(crate) callback: PolicyCallback,
     pub(crate) verdict_timeout: Option<Duration>,
     pub(crate) events: CategorySet,
+    pub(crate) approvable: Permissions,
+    /// `approvable` parsed at sandbox build.
+    pub(crate) approvable_net_allow: Vec<crate::network::NetAllow>,
 }
 
 impl PolicyFn {
@@ -480,6 +483,8 @@ impl PolicyFn {
             callback: Arc::new(callback),
             verdict_timeout: Some(Duration::from_secs(5)),
             events: CategorySet::ALL,
+            approvable: Permissions::new(),
+            approvable_net_allow: Vec::new(),
         }
     }
 
@@ -496,6 +501,13 @@ impl PolicyFn {
     /// callback skips file traps and execve freezing.
     pub fn events(mut self, categories: &[SyscallCategory]) -> Self {
         self.events = CategorySet::of(categories);
+        self
+    }
+
+    /// The most an approval may open beyond `net_allow`. Destinations here
+    /// but not yet allowed are held for the callback instead of refused.
+    pub fn approvable(mut self, permissions: Permissions) -> Self {
+        self.approvable = permissions;
         self
     }
 }

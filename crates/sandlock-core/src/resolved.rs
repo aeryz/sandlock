@@ -95,7 +95,8 @@ impl SandboxFeatures {
             http_acl,
             argv_safety_required: policy_events.contains(SyscallCategory::Process) || exec_handler,
             sysv_ipc_allowed: sandbox.allows_sysv_ipc(),
-            net_allow_present: sandbox.net_allow_is_active(),
+            net_allow_present: sandbox.net_allow_is_active()
+                || !sandbox.approvable_net_allow().is_empty(),
             net_deny: !sandbox.net_deny.is_empty(),
         }
     }

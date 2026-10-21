@@ -1500,3 +1500,73 @@ async fn deferred_approval_resolved_by_later_event() {
     assert!(result.success());
     assert_eq!(content, "CONNECTED");
 }
+
+fn connect_probe(port: u16, out: &std::path::Path) -> String {
+    format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('ERR%d' % e.errno)\n",
+        ),
+        port = port,
+        out = out.display()
+    )
+}
+
+/// Approvable rules bound what an approval may open; on their own they open
+/// nothing. With only process events subscribed nobody can approve.
+#[tokio::test]
+async fn approvable_does_not_open_network_by_itself() {
+    let out = temp_file("approvable-closed");
+    let (listener, port) = loopback_listener("127.0.0.1");
+    listener.set_nonblocking(true).unwrap();
+    let mut policy = base_policy()
+        .policy_fn(
+            PolicyFn::new(|_e, _c| Verdict::Allow)
+                .events(&[SyscallCategory::Process])
+                .approvable(Permissions::new().net_allow("*:*")),
+        )
+        .build()
+        .unwrap();
+    let script = connect_probe(port, &out);
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(content, "ERR111");
+    assert!(listener.accept().is_err(), "connect reached the listener");
+}
+
+/// The resolver needs UDP sockets, so an approvable sandbox that starts with
+/// no network must still be able to create them.
+#[tokio::test]
+async fn approvable_allows_udp_socket_creation() {
+    let out = temp_file("approvable-udp-socket");
+    let mut policy = base_policy()
+        .policy_fn(
+            PolicyFn::new(|_e, _c| Verdict::Allow)
+                .events(&[SyscallCategory::Process])
+                .approvable(Permissions::new().net_allow("*:*")),
+        )
+        .build()
+        .unwrap();
+    let script = format!(
+        "import socket\nsocket.socket(socket.AF_INET, socket.SOCK_DGRAM).close()\nopen('{}', 'w').write('OK')\n",
+        out.display()
+    );
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(content, "OK");
+}

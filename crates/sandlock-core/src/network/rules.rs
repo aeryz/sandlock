@@ -418,14 +418,30 @@ pub struct ResolvedNetAllowSet {
 /// (PortAllow::Any). A `*` host on ICMP becomes `any_ip_all_ports`,
 /// which the handler reads as "no destination check."
 pub async fn resolve_net_allow(rules: &[NetAllow]) -> io::Result<ResolvedNetAllowSet> {
-    use crate::seccomp::notif::PortAllow;
+    let (host_ips, concrete_host_entries) = resolve_hosts(rules).await?;
+    Ok(resolve_with_hosts(rules, &host_ips, concrete_host_entries))
+}
 
-    // Resolve each unique hostname once, up front. A scheme-less spec
-    // expands to a TCP + UDP rule pair naming the same host; one lookup
-    // per protocol pass could disagree under DNS round-robin, leaving
-    // the two allowlists pinned to different IPs, and would emit the
-    // `/etc/hosts` line once per pass.
-    let mut host_ips: HashMap<&str, Vec<IpAddr>> = HashMap::new();
+/// Resolve the launch rules and the launch-plus-approvable rules from one
+/// lookup per hostname, so both sets agree on every host's addresses.
+pub async fn resolve_net_allow_pair(
+    launch: &[NetAllow],
+    approvable: &[NetAllow],
+) -> io::Result<(ResolvedNetAllowSet, ResolvedNetAllowSet)> {
+    let all: Vec<NetAllow> = launch.iter().chain(approvable).cloned().collect();
+    let (host_ips, concrete_host_entries) = resolve_hosts(&all).await?;
+    Ok((
+        resolve_with_hosts(launch, &host_ips, concrete_host_entries.clone()),
+        resolve_with_hosts(&all, &host_ips, concrete_host_entries),
+    ))
+}
+
+// Resolve each unique hostname once, up front. A scheme-less spec expands to
+// a TCP + UDP rule pair naming the same host; one lookup per protocol pass
+// could disagree under DNS round-robin, leaving the two allowlists pinned to
+// different IPs, and would emit the `/etc/hosts` line once per pass.
+async fn resolve_hosts(rules: &[NetAllow]) -> io::Result<(HashMap<String, Vec<IpAddr>>, String)> {
+    let mut host_ips: HashMap<String, Vec<IpAddr>> = HashMap::new();
     let mut concrete_host_entries = String::new();
     for rule in rules {
         if let NetTarget::Host(host) = &rule.target {
@@ -443,9 +459,18 @@ pub async fn resolve_net_allow(rules: &[NetAllow]) -> io::Result<ResolvedNetAllo
             for ip in &ips {
                 concrete_host_entries.push_str(&format!("{} {}\n", ip, host));
             }
-            host_ips.insert(host.as_str(), ips);
+            host_ips.insert(host.clone(), ips);
         }
     }
+    Ok((host_ips, concrete_host_entries))
+}
+
+fn resolve_with_hosts(
+    rules: &[NetAllow],
+    host_ips: &HashMap<String, Vec<IpAddr>>,
+    concrete_host_entries: String,
+) -> ResolvedNetAllowSet {
+    use crate::seccomp::notif::PortAllow;
 
     let per_proto = |target: Protocol| {
         let mut per_ip: HashMap<IpAddr, HashSet<u16>> = HashMap::new();
@@ -502,12 +527,12 @@ pub async fn resolve_net_allow(rules: &[NetAllow]) -> io::Result<ResolvedNetAllo
         }
     };
 
-    Ok(ResolvedNetAllowSet {
+    ResolvedNetAllowSet {
         tcp: per_proto(Protocol::Tcp),
         udp: per_proto(Protocol::Udp),
         icmp: per_proto(Protocol::Icmp),
         concrete_host_entries,
-    })
+    }
 }
 
 /// Per-protocol resolved deny policies, ready for `NetworkState`.

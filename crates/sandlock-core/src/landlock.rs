@@ -380,7 +380,7 @@ pub fn compute_net_mask(
     }
     use crate::sandbox::Protocol;
     let allow_all_ports = sandbox
-        .effective_net_allow()
+        .launch_and_approvable_net_allow()
         .iter()
         .any(|r| r.protocol == Protocol::Tcp && r.all_ports);
     let deny_only = !sandbox.net_deny.is_empty() && !sandbox.net_allow_is_active();
@@ -657,7 +657,7 @@ fn confine_inner(
         // Explicit rules plus HTTP-derived reachability; HTTP intercept ports
         // are also added below (derived ports are a subset of them, kept here
         // so the gate stays in sync with the resolved allowlist).
-        for rule in policy.effective_net_allow().iter() {
+        for rule in policy.launch_and_approvable_net_allow().iter() {
             // TCP-only — see net_wildcard comment above.
             if rule.protocol != Protocol::Tcp {
                 continue;
@@ -955,6 +955,54 @@ mod mask_contract_tests {
             LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP,
             "combined finite keeps both TCP hooks",
         );
+    }
+
+    fn approvable_sandbox(spec: &str) -> Sandbox {
+        use crate::policy_fn::{Permissions, PolicyFn, Verdict};
+        Sandbox::builder()
+            .policy_fn(
+                PolicyFn::new(|_e, _c| Verdict::Allow)
+                    .approvable(Permissions::new().net_allow(spec)),
+            )
+            .build()
+            .expect("approvable sandbox builds")
+    }
+
+    #[test]
+    fn approvable_star_unhandles_connect() {
+        let pol = ProtectionPolicy::strict_all();
+        let sb = approvable_sandbox("*:*");
+        assert!(!sb.net_allow_is_active());
+        let (mask, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert!(
+            wildcard,
+            "an approvable *:* must not leave CONNECT_TCP gated"
+        );
+        assert_eq!(mask & LANDLOCK_ACCESS_NET_CONNECT_TCP, 0);
+    }
+
+    #[test]
+    fn approvable_ports_reach_connect_rules() {
+        let pol = ProtectionPolicy::strict_all();
+        let sb = approvable_sandbox("tcp://*:443");
+        let (_, wildcard) = compute_net_mask(6, &pol, &sb, true);
+        assert!(!wildcard);
+        assert!(sb
+            .launch_and_approvable_net_allow()
+            .iter()
+            .any(|r| r.ports == vec![443]));
+    }
+
+    #[test]
+    fn approvable_rejects_bad_spec_at_build() {
+        use crate::policy_fn::{Permissions, PolicyFn, Verdict};
+        assert!(Sandbox::builder()
+            .policy_fn(
+                PolicyFn::new(|_e, _c| Verdict::Allow)
+                    .approvable(Permissions::new().net_allow("tcp://*:notaport")),
+            )
+            .build()
+            .is_err());
     }
 
     #[test]

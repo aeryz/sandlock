@@ -839,6 +839,21 @@ impl Sandbox {
         out
     }
 
+    /// Approvable rules beyond [`Self::effective_net_allow`]. Launch-time
+    /// layers cannot be loosened later, so they are built from both.
+    pub(crate) fn approvable_net_allow(&self) -> &[NetAllow] {
+        self.policy_fn
+            .as_ref()
+            .map_or(&[], |pf| pf.approvable_net_allow.as_slice())
+    }
+
+    /// Launch rules plus approvable rules.
+    pub(crate) fn launch_and_approvable_net_allow(&self) -> Vec<NetAllow> {
+        let mut out = self.effective_net_allow();
+        out.extend_from_slice(self.approvable_net_allow());
+        out
+    }
+
     /// Whether the outbound allow rules are an active runtime layer.
     ///
     /// Derived from the separated configuration: explicit `--net-allow` rules
@@ -2178,10 +2193,12 @@ impl Sandbox {
 
         let pipes = PipePair::new().map_err(SandboxRuntimeError::Io)?;
 
-        let effective_net_allow = self.effective_net_allow();
-        let resolved_net_allow = network::resolve_net_allow(&effective_net_allow)
-            .await
-            .map_err(SandboxRuntimeError::Io)?;
+        let (resolved_net_allow, resolved_approvable) = network::resolve_net_allow_pair(
+            &self.effective_net_allow(),
+            self.approvable_net_allow(),
+        )
+        .await
+        .map_err(SandboxRuntimeError::Io)?;
         // In chroot/image mode, seed the synthetic /etc/hosts from the
         // rootfs's own file so entries baked into the image (private
         // registries, internal hostnames, etc.) survive virtualization.
@@ -2190,7 +2207,7 @@ impl Sandbox {
         // appended on top.
         let virtual_etc_hosts = network::compose_virtual_etc_hosts(
             self.chroot.as_deref(),
-            &resolved_net_allow.concrete_host_entries,
+            &resolved_approvable.concrete_host_entries,
         );
 
         let mut ca_inject_pem: Option<std::sync::Arc<Vec<u8>>> = None;
@@ -2653,8 +2670,11 @@ impl Sandbox {
                 } else {
                     crate::network::NetRuleSet::default()
                 };
+                let mut net_approvable =
+                    crate::network::NetRuleSet::from_resolved(&resolved_approvable);
+                net_approvable.union(&net_allow);
                 let live = crate::policy_fn::LivePolicy {
-                    net_approvable: net_allow.clone(),
+                    net_approvable,
                     net_allow,
                     max_memory_bytes: notif_policy.max_memory_bytes,
                     max_processes: notif_policy.max_processes,
