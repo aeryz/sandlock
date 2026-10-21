@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from sandlock import Sandbox, PolicyFn, SyscallEvent, PolicyContext
+from sandlock import Sandbox, PolicyFn, Permissions, SyscallEvent, PolicyContext
 
 
 _PYTHON_READABLE = list(dict.fromkeys([
@@ -151,20 +151,15 @@ class TestPolicyFnEvents:
 
 class TestPolicyFnRestrict:
     def test_restrict_network_on_execve(self):
-        """restrict_network narrows outbound to the listed IPs after execve.
+        """restrict narrows outbound to the listed rules after execve.
 
-        The old version called ``restrict_network([])`` — an empty list is a
-        no-op (the override is skipped when it lists no IPs) — and asserted only
-        that the program printed, so it verified nothing about the restriction.
-
-        Use two live loopback listeners on 127.0.0.1 and 127.0.0.2, both
-        allowlisted up front so either would connect. Restricting to
-        ``["127.0.0.1"]`` must then permit the first and deny the second
-        (ECONNREFUSED, errno 111). Without enforcement both would connect.
+        Two live loopback listeners are both allowlisted up front, so either
+        would connect; restricting to 127.0.0.1 must permit the first and
+        refuse the second (ECONNREFUSED, errno 111).
         """
         def on_event(event, ctx):
             if event.syscall in ("execve", "execveat"):
-                ctx.restrict_network(["127.0.0.1"])
+                ctx.restrict(net_allow=["127.0.0.1:*"])
 
         with _loopback_listener("127.0.0.1") as (h1, p1), \
                 _loopback_listener("127.0.0.2") as (h2, p2):
@@ -385,17 +380,14 @@ class TestPolicyFnVerdict:
 
 class TestPolicyFnPerPid:
     def test_restrict_pid_network(self):
-        """restrict_pid_network narrows a specific pid's outbound to the listed IPs.
+        """restrict_pid narrows a specific pid's outbound to the listed rules.
 
-        The old version restricted the pid then ran ``echo ok`` — it never made
-        a network call, so it could not observe any restriction. Mirror
-        test_restrict_network_on_execve with two live loopback listeners, both
-        allowlisted: restricting the exec'd pid to ["127.0.0.1"] must permit the
-        first and refuse the second (errno 111).
+        Mirrors test_restrict_network_on_execve: restricting the exec'd pid to
+        127.0.0.1 must permit the first listener and refuse the second.
         """
         def on_event(event, ctx):
             if event.syscall in ("execve", "execveat"):
-                ctx.restrict_pid_network(event.pid, ["127.0.0.1"])
+                ctx.restrict_pid(event.pid, net_allow=["127.0.0.1:*"])
 
         with _loopback_listener("127.0.0.1") as (h1, p1), \
                 _loopback_listener("127.0.0.2") as (h2, p2):
@@ -453,7 +445,9 @@ def test_network_events_only():
         return 0
 
     with _loopback_listener() as (host, port):
-        result = _policy(policy_fn=PolicyFn(on_event, events=["network"])).run(
+        result = _policy(
+            net_allow=[f"{host}:{port}"], policy_fn=PolicyFn(on_event, events=["network"])
+        ).run(
             ["python3", "-c",
              "import socket, subprocess\n"
              "open('/etc/hostname').read()\n"
@@ -604,3 +598,122 @@ def test_deferred_approval_answered_by_later_event():
         )
         result = policy.run([sys.executable, "-c", script])
     assert result.success, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Approvable network grants
+# ---------------------------------------------------------------------------
+
+_CONNECT_TWICE = (
+    "import socket, sys\n"
+    "res = []\n"
+    "for _ in range(2):\n"
+    "    s = socket.socket(); s.settimeout(5)\n"
+    "    try:\n"
+    "        s.connect(('127.0.0.1', int(sys.argv[1]))); res.append('OK')\n"
+    "    except OSError as e: res.append('ERR%d' % e.errno)\n"
+    "    finally: s.close()\n"
+    "print(' '.join(res))\n"
+)
+
+
+def _network_approver(answer):
+    """Hand each held network operation to ``answer`` on another thread."""
+    import queue
+
+    approvals = queue.Queue()
+
+    def worker():
+        while (approval := approvals.get()) is not None:
+            answer(approval)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+
+    def on_event(event, ctx, approval):
+        if approval is None:
+            return
+        if event.syscall == "connect":
+            approvals.put(approval)
+        else:
+            approval.allow()
+
+    def stop():
+        approvals.put(None)
+        thread.join()
+
+    return on_event, stop
+
+
+def _run_approvable(answer, approvable=("127.0.0.1:*",)):
+    on_event, stop = _network_approver(answer)
+    with _loopback_listener("127.0.0.1") as (_, port):
+        try:
+            result = _policy(policy_fn=PolicyFn(
+                on_event, deferred=True, events={"network"},
+                approvable=Permissions(net_allow=list(approvable)),
+            )).run([sys.executable, "-c", _CONNECT_TWICE, str(port)])
+        finally:
+            stop()
+    assert result.success, result.error
+    return result.stdout.decode().strip()
+
+
+def test_approval_grants_network_from_thread():
+    assert _run_approvable(lambda a: a.allow(net_allow=["127.0.0.1:*"])) == "OK OK"
+
+
+def test_approval_allow_outside_approvable_raises():
+    errors = []
+
+    def answer(approval):
+        try:
+            approval.allow(net_allow=["10.0.0.0/8:*"])
+        except PermissionError as e:
+            errors.append(e)
+            approval.deny()
+
+    assert _run_approvable(answer) == "ERR111 ERR111"
+    assert len(errors) == 2
+
+
+def test_approval_allow_rejects_hostname():
+    errors = []
+
+    def answer(approval):
+        try:
+            approval.allow(net_allow=["example.com:443"])
+        except ValueError as e:
+            errors.append(e)
+            approval.allow()
+
+    assert _run_approvable(answer) == "OK OK"
+    assert len(errors) == 2
+
+
+def test_policy_fn_without_net_allow_denies_connect():
+    with _loopback_listener("127.0.0.1") as (_, port):
+        result = _policy(policy_fn=PolicyFn(lambda event, ctx: None)).run(
+            [sys.executable, "-c", _CONNECT_TWICE, str(port)]
+        )
+    assert result.success, result.error
+    assert result.stdout.decode().strip() == "ERR111 ERR111"
+
+
+def test_restrict_requires_keyword():
+    errors = []
+
+    def on_event(event, ctx):
+        if event.syscall in ("execve", "execveat"):
+            try:
+                ctx.restrict()
+            except TypeError as e:
+                errors.append(e)
+
+    assert _policy(policy_fn=PolicyFn(on_event)).run(["/bin/true"]).success
+    assert errors
+
+
+def test_permissions_rejects_bare_string():
+    with pytest.raises(TypeError):
+        Permissions(net_allow="*:*")
