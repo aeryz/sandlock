@@ -65,7 +65,7 @@ impl SandboxFeatures {
         let network_destination_policy = !sandbox.net_allow.is_empty()
             || http_reachability
             || !sandbox.net_deny.is_empty()
-            // Any callback may restrict_network() from any event category.
+            // Live policy_fn rules replace the static allowlist on every connect.
             || sandbox.policy_fn.is_some()
             || http_acl;
         let bind_denylist = !sandbox.net_deny_bind.is_empty();
@@ -95,7 +95,8 @@ impl SandboxFeatures {
             http_acl,
             argv_safety_required: policy_events.contains(SyscallCategory::Process) || exec_handler,
             sysv_ipc_allowed: sandbox.allows_sysv_ipc(),
-            net_allow_present: sandbox.net_allow_is_active(),
+            net_allow_present: sandbox.net_allow_is_active()
+                || !sandbox.approvable_net_allow().is_empty(),
             net_deny: !sandbox.net_deny.is_empty(),
         }
     }

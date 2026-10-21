@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import datetime
+import errno
 import json
 import os
 import signal
@@ -186,23 +187,6 @@ class _CEvent(ctypes.Structure):
     ]
 
 _c_ctx_p = ctypes.c_void_p
-_POLICY_FN_TYPE = ctypes.CFUNCTYPE(
-    ctypes.c_int32,
-    ctypes.POINTER(_CEvent),
-    _c_ctx_p,
-    ctypes.c_void_p,
-)
-
-_lib.sandlock_sandbox_builder_policy_fn.restype = _c_builder_p
-_lib.sandlock_sandbox_builder_policy_fn.argtypes = [
-    _c_builder_p,
-    _POLICY_FN_TYPE,
-    ctypes.c_int64,
-    ctypes.c_uint32,
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-]
-
 _POLICY_DEFERRED_FN_TYPE = ctypes.CFUNCTYPE(
     None,
     ctypes.POINTER(_CEvent),
@@ -230,11 +214,14 @@ _lib.sandlock_approval_is_cancelled.argtypes = [ctypes.c_void_p]
 _lib.sandlock_approval_free.restype = None
 _lib.sandlock_approval_free.argtypes = [ctypes.c_void_p]
 
-_lib.sandlock_ctx_restrict_network.restype = None
-_lib.sandlock_ctx_restrict_network.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
+_lib.sandlock_ctx_restrict_net_allow.restype = ctypes.c_int
+_lib.sandlock_ctx_restrict_net_allow.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
 
-_lib.sandlock_ctx_grant_network.restype = None
-_lib.sandlock_ctx_grant_network.argtypes = [_c_ctx_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
+_lib.sandlock_approval_grant_net_allow.restype = ctypes.c_int
+_lib.sandlock_approval_grant_net_allow.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
+
+_lib.sandlock_sandbox_builder_approvable_net_allow.restype = _c_builder_p
+_lib.sandlock_sandbox_builder_approvable_net_allow.argtypes = [_c_builder_p, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
 
 _lib.sandlock_ctx_is_cancelled.restype = ctypes.c_bool
 _lib.sandlock_ctx_is_cancelled.argtypes = [_c_ctx_p]
@@ -245,8 +232,8 @@ _lib.sandlock_ctx_restrict_max_memory.argtypes = [_c_ctx_p, ctypes.c_uint64]
 _lib.sandlock_ctx_restrict_max_processes.restype = None
 _lib.sandlock_ctx_restrict_max_processes.argtypes = [_c_ctx_p, ctypes.c_uint32]
 
-_lib.sandlock_ctx_restrict_pid_network.restype = None
-_lib.sandlock_ctx_restrict_pid_network.argtypes = [_c_ctx_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
+_lib.sandlock_ctx_restrict_pid_net_allow.restype = ctypes.c_int
+_lib.sandlock_ctx_restrict_pid_net_allow.argtypes = [_c_ctx_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_char_p), ctypes.c_uint32]
 
 _lib.sandlock_ctx_deny_path.restype = ctypes.c_int
 _lib.sandlock_ctx_deny_path.argtypes = [_c_ctx_p, ctypes.c_char_p]
@@ -751,13 +738,10 @@ class PolicyContext:
     def __init__(self, ctx_ptr):
         self._ptr = ctx_ptr
 
-    def restrict_network(self, ips: list[str]) -> None:
-        arr = (ctypes.c_char_p * len(ips))(*[_encode(ip) for ip in ips])
-        _lib.sandlock_ctx_restrict_network(self._ptr, arr, len(ips))
-
-    def grant_network(self, ips: list[str]) -> None:
-        arr = (ctypes.c_char_p * len(ips))(*[_encode(ip) for ip in ips])
-        _lib.sandlock_ctx_grant_network(self._ptr, arr, len(ips))
+    def restrict(self, *, net_allow: Sequence[str] | None = None) -> None:
+        """Permanently narrow live and approvable network rules."""
+        arr, n = _spec_array(_required_specs(net_allow))
+        _check_grant(_lib.sandlock_ctx_restrict_net_allow(self._ptr, arr, n))
 
     def is_cancelled(self) -> bool:
         """Whether shutdown cancelled this callback; approval loops must exit when true."""
@@ -769,9 +753,10 @@ class PolicyContext:
     def restrict_max_processes(self, n: int) -> None:
         _lib.sandlock_ctx_restrict_max_processes(self._ptr, n)
 
-    def restrict_pid_network(self, pid: int, ips: list[str]) -> None:
-        arr = (ctypes.c_char_p * len(ips))(*[_encode(ip) for ip in ips])
-        _lib.sandlock_ctx_restrict_pid_network(self._ptr, pid, arr, len(ips))
+    def restrict_pid(self, pid: int, *, net_allow: Sequence[str] | None = None) -> None:
+        """Narrow one process's network below the live rules."""
+        arr, n = _spec_array(_required_specs(net_allow))
+        _check_grant(_lib.sandlock_ctx_restrict_pid_net_allow(self._ptr, pid, arr, n))
 
     def deny_path(self, path: str) -> None:
         """Deny access to a path (checked on openat). Requires filesystem events."""
@@ -812,11 +797,19 @@ class Approval:
         return ptr
 
     def resolve(self, verdict) -> None:
-        """Answer with a value a synchronous callback could return."""
+        """Answer with a value a synchronous callback could return. A refused
+        ``Grant`` denies the operation, then raises."""
+        from .sandbox import Grant
+
+        if isinstance(verdict, Grant):
+            arr, n = _spec_array(list(verdict.net_allow))
         ptr = self._take()
         if ptr is None:
             raise RuntimeError("approval already answered")
-        _lib.sandlock_approval_resolve(ptr, _verdict_code(verdict))
+        if isinstance(verdict, Grant):
+            _check_grant(_lib.sandlock_approval_grant_net_allow(ptr, arr, n))
+        else:
+            _lib.sandlock_approval_resolve(ptr, _verdict_code(verdict))
 
     def allow(self) -> None:
         self.resolve(None)
@@ -842,6 +835,29 @@ class Approval:
 # ----------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------
+
+def _specs(specs) -> list[str]:
+    if isinstance(specs, (str, bytes)):
+        raise TypeError("net_allow must be a collection of specs, not a string")
+    return list(specs)
+
+
+def _required_specs(net_allow) -> list[str]:
+    if net_allow is None:
+        raise TypeError("expected a permission keyword such as net_allow")
+    return _specs(net_allow)
+
+
+def _spec_array(specs: list[str]):
+    return (ctypes.c_char_p * len(specs))(*[_encode(s) for s in specs]), len(specs)
+
+
+def _check_grant(rc: int) -> None:
+    if rc == -errno.EPERM:
+        raise PermissionError("outside the approvable rules")
+    if rc != 0:
+        raise ValueError("invalid net_allow rule (hostnames are not accepted here)")
+
 
 def _encode(s: str) -> bytes:
     if isinstance(s, str):
@@ -1463,28 +1479,30 @@ class _NativePolicy:
                 )
 
             if policy_fn.deferred:
-                def _c_deferred(event_p, ctx_p, approval_p, _user_data):
-                    approval = Approval(approval_p) if approval_p else None
-                    try:
-                        policy_fn.callback(_py_event(event_p), PolicyContext(ctx_p), approval)
-                    except BaseException:
-                        if approval is not None:
-                            approval.close()
-                        raise
-
-                c_callback = _POLICY_DEFERRED_FN_TYPE(_c_deferred)
-                b = _lib.sandlock_sandbox_builder_policy_fn_deferred(
-                    b, c_callback, policy_fn._verdict_timeout_ms(), policy_fn._events_mask(), None, None,
-                )
+                callback = policy_fn.callback
             else:
-                def _c_callback(event_p, ctx_p, _user_data):
-                    result = policy_fn.callback(_py_event(event_p), PolicyContext(ctx_p))
-                    return _verdict_code(result)
+                # Answered through the approval so a returned Grant can apply.
+                def callback(event, ctx, approval):
+                    result = policy_fn.callback(event, ctx)
+                    if approval is not None:
+                        approval.resolve(result)
 
-                c_callback = _POLICY_FN_TYPE(_c_callback)
-                b = _lib.sandlock_sandbox_builder_policy_fn(
-                    b, c_callback, policy_fn._verdict_timeout_ms(), policy_fn._events_mask(), None, None,
-                )
+            def _c_deferred(event_p, ctx_p, approval_p, _user_data):
+                approval = Approval(approval_p) if approval_p else None
+                try:
+                    callback(_py_event(event_p), PolicyContext(ctx_p), approval)
+                except BaseException:
+                    if approval is not None:
+                        approval.close()
+                    raise
+
+            c_callback = _POLICY_DEFERRED_FN_TYPE(_c_deferred)
+            b = _lib.sandlock_sandbox_builder_policy_fn_deferred(
+                b, c_callback, policy_fn._verdict_timeout_ms(), policy_fn._events_mask(), None, None,
+            )
+            if policy_fn.approvable is not None:
+                arr, n = _spec_array(list(policy_fn.approvable.net_allow))
+                b = _lib.sandlock_sandbox_builder_approvable_net_allow(b, arr, n)
 
         err = ctypes.c_int(0)
         err_msg = ctypes.c_char_p()

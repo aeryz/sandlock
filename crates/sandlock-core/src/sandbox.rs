@@ -839,6 +839,21 @@ impl Sandbox {
         out
     }
 
+    /// Approvable rules beyond [`Self::effective_net_allow`]. Launch-time
+    /// layers cannot be loosened later, so they are built from both.
+    pub(crate) fn approvable_net_allow(&self) -> &[NetAllow] {
+        self.policy_fn
+            .as_ref()
+            .map_or(&[], |pf| pf.approvable_net_allow.as_slice())
+    }
+
+    /// Launch rules plus approvable rules.
+    pub(crate) fn launch_and_approvable_net_allow(&self) -> Vec<NetAllow> {
+        let mut out = self.effective_net_allow();
+        out.extend_from_slice(self.approvable_net_allow());
+        out
+    }
+
     /// Whether the outbound allow rules are an active runtime layer.
     ///
     /// Derived from the separated configuration: explicit `--net-allow` rules
@@ -2178,10 +2193,12 @@ impl Sandbox {
 
         let pipes = PipePair::new().map_err(SandboxRuntimeError::Io)?;
 
-        let effective_net_allow = self.effective_net_allow();
-        let resolved_net_allow = network::resolve_net_allow(&effective_net_allow)
-            .await
-            .map_err(SandboxRuntimeError::Io)?;
+        let (resolved_net_allow, resolved_approvable) = network::resolve_net_allow_pair(
+            &self.effective_net_allow(),
+            self.approvable_net_allow(),
+        )
+        .await
+        .map_err(SandboxRuntimeError::Io)?;
         // In chroot/image mode, seed the synthetic /etc/hosts from the
         // rootfs's own file so entries baked into the image (private
         // registries, internal hostnames, etc.) survive virtualization.
@@ -2190,7 +2207,7 @@ impl Sandbox {
         // appended on top.
         let virtual_etc_hosts = network::compose_virtual_etc_hosts(
             self.chroot.as_deref(),
-            &resolved_net_allow.concrete_host_entries,
+            &resolved_approvable.concrete_host_entries,
         );
 
         let mut ca_inject_pem: Option<std::sync::Arc<Vec<u8>>> = None;
@@ -2644,36 +2661,28 @@ impl Sandbox {
             }
 
             if let Some(ref policy_fn) = self.policy_fn {
-                let mut allowed_ips: std::collections::HashSet<std::net::IpAddr> =
-                    std::collections::HashSet::new();
-                for p in [
-                    &net_state.tcp_policy,
-                    &net_state.udp_policy,
-                    &net_state.icmp_policy,
-                ] {
-                    if let crate::seccomp::notif::NetworkPolicy::AllowList {
-                        per_ip, cidrs, ..
-                    } = p
-                    {
-                        allowed_ips.extend(per_ip.keys().copied());
-                        // IP literals resolve to single-host CIDRs (/32 or
-                        // /128); surface them as concrete allowed IPs too.
-                        for (net, _) in cidrs {
-                            if net.is_single_host() {
-                                allowed_ips.insert(net.addr);
-                            }
-                        }
-                    }
-                }
+                let net_allow = if self.net_allow_is_active() {
+                    crate::network::NetRuleSet::from_resolved(&resolved_net_allow)
+                } else if !self.net_deny.is_empty() {
+                    // Deny-only policies are default-allow; net_deny still applies.
+                    crate::network::NetRuleSet::parse_literal(&["*:*", "icmp://*"])
+                        .expect("literal wildcard rules parse")
+                } else {
+                    crate::network::NetRuleSet::default()
+                };
+                let mut net_approvable =
+                    crate::network::NetRuleSet::from_resolved(&resolved_approvable);
+                net_approvable.union(&net_allow);
                 let live = crate::policy_fn::LivePolicy {
-                    allowed_ips,
+                    net_approvable,
+                    net_allow,
                     max_memory_bytes: notif_policy.max_memory_bytes,
                     max_processes: notif_policy.max_processes,
                 };
                 let ceiling = live.clone();
                 let live = std::sync::Arc::new(std::sync::RwLock::new(live));
                 let denied = policy_fn_state.denied.clone();
-                let pid_overrides = net_state.pid_ip_overrides.clone();
+                let pid_overrides = net_state.pid_net_overrides.clone();
                 policy_fn_state.live_policy = Some(live.clone());
                 let worker = crate::policy_fn::spawn_policy_fn(
                     policy_fn.callback.clone(),

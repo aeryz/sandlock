@@ -3,9 +3,10 @@ use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sandlock_ffi::{
-    sandlock_approval_free, sandlock_approval_is_cancelled, sandlock_approval_resolve,
-    sandlock_approval_t, sandlock_ctx_t, sandlock_event_t, sandlock_result_free,
-    sandlock_result_success, sandlock_run, sandlock_sandbox_build,
+    sandlock_approval_free, sandlock_approval_grant_net_allow, sandlock_approval_is_cancelled,
+    sandlock_approval_resolve, sandlock_approval_t, sandlock_ctx_restrict_net_allow,
+    sandlock_ctx_t, sandlock_event_t, sandlock_result_free, sandlock_result_success, sandlock_run,
+    sandlock_sandbox_build, sandlock_sandbox_builder_approvable_net_allow,
     sandlock_sandbox_builder_fs_read, sandlock_sandbox_builder_new,
     sandlock_sandbox_builder_policy_fn, sandlock_sandbox_builder_policy_fn_deferred,
     sandlock_sandbox_free, SANDLOCK_EVENT_ALL,
@@ -135,4 +136,125 @@ fn deferred_approval_resolved_from_another_thread() {
 fn deferred_approval_denies_with_errno_or_when_freed() {
     assert!(!run_with_approver(Some(13)));
     assert!(!run_with_approver(None));
+}
+
+fn read_only_builder() -> *mut sandlock_core::SandboxBuilder {
+    let mut b = sandlock_sandbox_builder_new();
+    for p in ["/usr", "/lib", "/lib64", "/bin", "/etc", "/proc"] {
+        if !std::path::Path::new(p).exists() {
+            continue;
+        }
+        let c = CString::new(p).unwrap();
+        b = unsafe { sandlock_sandbox_builder_fs_read(b, c.as_ptr()) };
+    }
+    b
+}
+
+fn run_true(b: *mut sandlock_core::SandboxBuilder) -> bool {
+    let mut err = 0;
+    let policy = unsafe { sandlock_sandbox_build(b, &mut err, ptr::null_mut()) };
+    assert!(!policy.is_null(), "build failed with err={err}");
+    let cmd = CString::new("/bin/true").unwrap();
+    let argv = [cmd.as_ptr()];
+    let result = unsafe { sandlock_run(policy, ptr::null(), argv.as_ptr(), 1) };
+    let success = !result.is_null() && unsafe { sandlock_result_success(result) };
+    unsafe {
+        sandlock_result_free(result);
+        sandlock_sandbox_free(policy);
+    }
+    success
+}
+
+/// Answer each held approval with a grant of `spec`; returns the codes and
+/// whether `/bin/true` ran.
+fn grant_on_every_approval(spec: &'static str) -> (Vec<i32>, bool) {
+    let (tx, rx) = std::sync::mpsc::channel::<usize>();
+    let approver = Box::into_raw(Box::new(Approver {
+        tx: std::sync::Mutex::new(tx),
+    }));
+    let resolver = std::thread::spawn(move || {
+        let spec = CString::new(spec).unwrap();
+        let specs = [spec.as_ptr()];
+        let mut codes = Vec::new();
+        for approval in rx {
+            let approval = approval as *mut sandlock_approval_t;
+            codes.push(unsafe { sandlock_approval_grant_net_allow(approval, specs.as_ptr(), 1) });
+        }
+        codes
+    });
+    let mut b = unsafe {
+        sandlock_sandbox_builder_policy_fn_deferred(
+            read_only_builder(),
+            deferred_callback,
+            5000,
+            SANDLOCK_EVENT_ALL,
+            approver as *mut c_void,
+            Some(drop_approver),
+        )
+    };
+    let approvable = CString::new("127.0.0.1:*").unwrap();
+    let approvable = [approvable.as_ptr()];
+    b = unsafe { sandlock_sandbox_builder_approvable_net_allow(b, approvable.as_ptr(), 1) };
+    let ran = run_true(b);
+    (resolver.join().unwrap(), ran)
+}
+
+#[test]
+fn approval_grant_within_approvable_allows() {
+    let (codes, ran) = grant_on_every_approval("127.0.0.1:*");
+    assert!(ran);
+    assert!(
+        !codes.is_empty() && codes.iter().all(|&rc| rc == 0),
+        "{codes:?}"
+    );
+}
+
+#[test]
+fn approval_grant_outside_approvable_denies() {
+    let (codes, ran) = grant_on_every_approval("10.0.0.0/8:*");
+    assert!(!ran);
+    assert!(
+        !codes.is_empty() && codes.iter().all(|&rc| rc == -libc::EPERM),
+        "{codes:?}"
+    );
+}
+
+#[test]
+fn approval_grant_hostname_denies() {
+    let (codes, ran) = grant_on_every_approval("example.com:443");
+    assert!(!ran);
+    assert!(
+        !codes.is_empty() && codes.iter().all(|&rc| rc == -libc::EINVAL),
+        "{codes:?}"
+    );
+}
+
+static RESTRICT_RC: std::sync::Mutex<Option<i32>> = std::sync::Mutex::new(None);
+
+unsafe extern "C" fn restrict_hostname_callback(
+    _event: *const sandlock_event_t,
+    ctx: *mut sandlock_ctx_t,
+    _user_data: *mut c_void,
+) -> i32 {
+    let spec = CString::new("example.com:443").unwrap();
+    let specs = [spec.as_ptr()];
+    let rc = sandlock_ctx_restrict_net_allow(ctx, specs.as_ptr(), 1);
+    RESTRICT_RC.lock().unwrap().get_or_insert(rc);
+    0
+}
+
+#[test]
+fn ctx_restrict_net_allow_rejects_hostname() {
+    let b = unsafe {
+        sandlock_sandbox_builder_policy_fn(
+            read_only_builder(),
+            restrict_hostname_callback,
+            5000,
+            SANDLOCK_EVENT_ALL,
+            ptr::null_mut(),
+            None,
+        )
+    };
+    assert!(run_true(b));
+    assert_eq!(*RESTRICT_RC.lock().unwrap(), Some(-libc::EINVAL));
 }

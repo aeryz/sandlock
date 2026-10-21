@@ -76,11 +76,13 @@ print("[agent] done")
         fs_readable = ["/usr", "/lib", "/lib64", "/bin",
                        "/etc", "/dev", "/tmp", workspace] + python_paths
         fs_writable = [workspace, "/tmp"]
+        net_allow = [f"127.0.0.1:{port}"]
 
         # --- Run 1: no defense ---
         print("=== Without policy_fn ===", flush=True)
         received.clear()
-        with Sandbox(fs_readable=fs_readable, fs_writable=fs_writable) as sb:
+        with Sandbox(fs_readable=fs_readable, fs_writable=fs_writable,
+                     net_allow=net_allow) as sb:
             result = sb.run(["python3", agent_py])
             print(result.stdout.decode(), end="", flush=True)
         print(f"Secret leaked: {bool(received)}\n", flush=True)
@@ -96,13 +98,14 @@ print("[agent] done")
                     if arg.endswith("setup.py"):
                         print(f"[policy_fn] PID {event.pid} "
                               f"argv={list(event.argv)}"
-                              " — restricting", flush=True)
-                        ctx.restrict_pid_network(event.pid, [])
+                              ": restricting", flush=True)
+                        ctx.restrict_pid(event.pid, net_allow=[])
                         break
 
         with Sandbox(
             fs_readable=fs_readable,
             fs_writable=fs_writable,
+            net_allow=net_allow,
             policy_fn=PolicyFn(install_guard),
         ) as sb:
             result = sb.run(["python3", agent_py])

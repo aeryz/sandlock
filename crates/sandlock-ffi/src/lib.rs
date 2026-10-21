@@ -2283,7 +2283,7 @@ pub type sandlock_policy_ud_drop_t = unsafe extern "C" fn(user_data: *mut c_void
 /// A held syscall's pending verdict, owned by the C caller.
 #[allow(non_camel_case_types)]
 pub struct sandlock_approval_t {
-    approval: sandlock_core::policy_fn::Approval,
+    approval: Option<sandlock_core::policy_fn::Approval>,
 }
 
 /// C callback type for a deferred policy_fn.
@@ -2503,7 +2503,9 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
                       ctx: &mut sandlock_core::policy_fn::PolicyContext,
                       approval: Option<sandlock_core::policy_fn::Approval>| {
         let approval = approval.map_or(ptr::null_mut(), |approval| {
-            Box::into_raw(Box::new(sandlock_approval_t { approval }))
+            Box::into_raw(Box::new(sandlock_approval_t {
+                approval: Some(approval),
+            }))
         });
         with_c_event(&event, |c_event| {
             let mut c_ctx = sandlock_ctx_t { ctx: ctx as *mut _ };
@@ -2521,6 +2523,66 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_policy_fn_deferred(
     Box::into_raw(Box::new(builder.policy_fn(policy_fn)))
 }
 
+/// Set the rules approvals may open beyond `net_allow`, replacing any set
+/// earlier. Must follow `sandlock_sandbox_builder_policy_fn` or its deferred
+/// variant; without a policy callback it has no effect. Specs are validated
+/// when the policy is built.
+///
+/// # Safety
+/// `b` must be a valid builder pointer. `specs` must point to `count` valid
+/// C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_sandbox_builder_approvable_net_allow(
+    b: *mut SandboxBuilder,
+    specs: *const *const c_char,
+    count: u32,
+) -> *mut SandboxBuilder {
+    if b.is_null() {
+        return b;
+    }
+    let mut builder = *Box::from_raw(b);
+    if let (Some(pf), Ok(p)) = (
+        builder.policy_fn.take(),
+        net_allow_permissions(specs, count),
+    ) {
+        builder.policy_fn = Some(pf.approvable(p));
+    }
+    Box::into_raw(Box::new(builder))
+}
+
+/// Resolve and free an approval with a grant: widen the live rules to `specs`
+/// (`net_allow` syntax, no hostnames) within the approvable rules, then allow.
+/// Returns 0, or `-EPERM` when a spec is outside the approvable rules and
+/// `-EINVAL` for a malformed spec; on failure the syscall is denied.
+///
+/// # Safety
+/// `approval` must be null or an approval not yet resolved or freed. `specs`
+/// must point to `count` valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_approval_grant_net_allow(
+    approval: *mut sandlock_approval_t,
+    specs: *const *const c_char,
+    count: u32,
+) -> c_int {
+    if approval.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(a) = Box::from_raw(approval).approval else {
+        return -libc::EINVAL;
+    };
+    let p = match net_allow_permissions(specs, count) {
+        Ok(p) => p,
+        Err(e) => {
+            a.deny();
+            return e;
+        }
+    };
+    match a.try_resolve(sandlock_core::policy_fn::Verdict::Grant(p)) {
+        Ok(()) => 0,
+        Err(e) => policy_fn_errno(&e),
+    }
+}
+
 /// Resolve and free an approval. `verdict` uses the policy callback's return
 /// encoding.
 ///
@@ -2532,9 +2594,9 @@ pub unsafe extern "C" fn sandlock_approval_resolve(
     verdict: i32,
 ) {
     if !approval.is_null() {
-        Box::from_raw(approval)
-            .approval
-            .resolve(policy_ret_to_verdict(verdict));
+        if let Some(a) = Box::from_raw(approval).approval {
+            a.resolve(policy_ret_to_verdict(verdict));
+        }
     }
 }
 
@@ -2547,7 +2609,11 @@ pub unsafe extern "C" fn sandlock_approval_resolve(
 pub unsafe extern "C" fn sandlock_approval_is_cancelled(
     approval: *const sandlock_approval_t,
 ) -> bool {
-    approval.is_null() || (*approval).approval.is_cancelled()
+    approval.is_null()
+        || (*approval)
+            .approval
+            .as_ref()
+            .map_or(true, |a| a.is_cancelled())
 }
 
 /// Free an approval without resolving it, which denies the syscall.
@@ -2571,51 +2637,56 @@ pub unsafe extern "C" fn sandlock_ctx_is_cancelled(ctx: *const sandlock_ctx_t) -
     ctx.is_null() || (*(*ctx).ctx).is_cancelled()
 }
 
-/// Restrict network to the given IPs. Permanent — cannot grant back.
+/// Collect `count` C strings as the `net_allow` of a `Permissions`; `count`
+/// zero names no destination.
+unsafe fn net_allow_permissions(
+    specs: *const *const c_char,
+    count: u32,
+) -> Result<sandlock_core::policy_fn::Permissions, i32> {
+    let mut p = sandlock_core::policy_fn::Permissions::new().net_allow_none();
+    if count > 0 && specs.is_null() {
+        return Err(-libc::EINVAL);
+    }
+    for i in 0..count as usize {
+        let spec = *specs.add(i);
+        if spec.is_null() {
+            return Err(-libc::EINVAL);
+        }
+        let spec = CStr::from_ptr(spec).to_str().map_err(|_| -libc::EINVAL)?;
+        p = p.net_allow(spec);
+    }
+    Ok(p)
+}
+
+fn policy_fn_errno(e: &sandlock_core::policy_fn::PolicyFnError) -> i32 {
+    match e {
+        sandlock_core::policy_fn::PolicyFnError::NotApprovable(_) => -libc::EPERM,
+        _ => -libc::EINVAL,
+    }
+}
+
+/// Permanently narrow live and approvable network rules to `specs`, in
+/// `net_allow` syntax without hostnames. Returns 0 or `-EINVAL`.
 ///
 /// # Safety
 /// `ctx` must be a valid context pointer from inside a policy callback.
-/// `ips` must point to `count` valid C strings.
+/// `specs` must point to `count` valid C strings.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_restrict_network(
+pub unsafe extern "C" fn sandlock_ctx_restrict_net_allow(
     ctx: *mut sandlock_ctx_t,
-    ips: *const *const c_char,
+    specs: *const *const c_char,
     count: u32,
-) {
+) -> c_int {
     if ctx.is_null() {
-        return;
+        return -libc::EINVAL;
     }
     let ctx = &mut *(*ctx).ctx;
-    let parsed: Vec<std::net::IpAddr> = (0..count as usize)
-        .filter_map(|i| {
-            let s = CStr::from_ptr(*ips.add(i)).to_str().ok()?;
-            s.parse().ok()
-        })
-        .collect();
-    ctx.restrict_network(&parsed);
-}
-
-/// Grant network IPs (within ceiling). Fails silently if restricted.
-///
-/// # Safety
-/// Same as `sandlock_ctx_restrict_network`.
-#[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_grant_network(
-    ctx: *mut sandlock_ctx_t,
-    ips: *const *const c_char,
-    count: u32,
-) {
-    if ctx.is_null() {
-        return;
+    match net_allow_permissions(specs, count)
+        .and_then(|p| ctx.restrict(&p).map_err(|e| policy_fn_errno(&e)))
+    {
+        Ok(()) => 0,
+        Err(e) => e,
     }
-    let ctx = &mut *(*ctx).ctx;
-    let parsed: Vec<std::net::IpAddr> = (0..count as usize)
-        .filter_map(|i| {
-            let s = CStr::from_ptr(*ips.add(i)).to_str().ok()?;
-            s.parse().ok()
-        })
-        .collect();
-    let _ = ctx.grant_network(&parsed);
 }
 
 /// Restrict max memory. Permanent.
@@ -2644,28 +2715,29 @@ pub unsafe extern "C" fn sandlock_ctx_restrict_max_processes(ctx: *mut sandlock_
     ctx.restrict_max_processes(n);
 }
 
-/// Restrict network for a specific PID.
+/// Narrow one process's network to `specs` on top of the live rules.
+/// Returns 0 or `-EINVAL`.
 ///
 /// # Safety
-/// `ctx` must be a valid context pointer. `ips` must point to `count` C strings.
+/// `ctx` must be a valid context pointer from inside a policy callback.
+/// `specs` must point to `count` valid C strings.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_ctx_restrict_pid_network(
+pub unsafe extern "C" fn sandlock_ctx_restrict_pid_net_allow(
     ctx: *mut sandlock_ctx_t,
     pid: u32,
-    ips: *const *const c_char,
+    specs: *const *const c_char,
     count: u32,
-) {
+) -> c_int {
     if ctx.is_null() {
-        return;
+        return -libc::EINVAL;
     }
-    let ctx = &mut *(*ctx).ctx;
-    let parsed: Vec<std::net::IpAddr> = (0..count as usize)
-        .filter_map(|i| {
-            let s = CStr::from_ptr(*ips.add(i)).to_str().ok()?;
-            s.parse().ok()
-        })
-        .collect();
-    ctx.restrict_pid_network(pid, &parsed);
+    let ctx = &*(*ctx).ctx;
+    match net_allow_permissions(specs, count)
+        .and_then(|p| ctx.restrict_pid(pid, &p).map_err(|e| policy_fn_errno(&e)))
+    {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }
 
 /// Deny access to a path dynamically (checked on openat). Returns 0, or -1

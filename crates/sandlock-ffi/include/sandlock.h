@@ -1278,6 +1278,34 @@ sandlock_builder_t *sandlock_sandbox_builder_policy_fn_deferred(sandlock_builder
                                                                 void (*user_data_drop)(void *user_data));
 
 /**
+ * Set the rules approvals may open beyond `net_allow`, replacing any set
+ * earlier. Must follow `sandlock_sandbox_builder_policy_fn` or its deferred
+ * variant; without a policy callback it has no effect. Specs are validated
+ * when the policy is built.
+ *
+ * # Safety
+ * `b` must be a valid builder pointer. `specs` must point to `count` valid
+ * C strings.
+ */
+sandlock_builder_t *sandlock_sandbox_builder_approvable_net_allow(sandlock_builder_t *b,
+                                                                  const char *const *specs,
+                                                                  uint32_t count);
+
+/**
+ * Resolve and free an approval with a grant: widen the live rules to `specs`
+ * (`net_allow` syntax, no hostnames) within the approvable rules, then allow.
+ * Returns 0, or `-EPERM` when a spec is outside the approvable rules and
+ * `-EINVAL` for a malformed spec; on failure the syscall is denied.
+ *
+ * # Safety
+ * `approval` must be null or an approval not yet resolved or freed. `specs`
+ * must point to `count` valid C strings.
+ */
+int sandlock_approval_grant_net_allow(sandlock_approval_t *approval,
+                                      const char *const *specs,
+                                      uint32_t count);
+
+/**
  * Resolve and free an approval. `verdict` uses the policy callback's return
  * encoding.
  *
@@ -1313,21 +1341,14 @@ void sandlock_approval_free(sandlock_approval_t *approval);
 bool sandlock_ctx_is_cancelled(const sandlock_ctx_t *ctx);
 
 /**
- * Restrict network to the given IPs. Permanent — cannot grant back.
+ * Permanently narrow live and approvable network rules to `specs`, in
+ * `net_allow` syntax without hostnames. Returns 0 or `-EINVAL`.
  *
  * # Safety
  * `ctx` must be a valid context pointer from inside a policy callback.
- * `ips` must point to `count` valid C strings.
+ * `specs` must point to `count` valid C strings.
  */
-void sandlock_ctx_restrict_network(sandlock_ctx_t *ctx, const char *const *ips, uint32_t count);
-
-/**
- * Grant network IPs (within ceiling). Fails silently if restricted.
- *
- * # Safety
- * Same as `sandlock_ctx_restrict_network`.
- */
-void sandlock_ctx_grant_network(sandlock_ctx_t *ctx, const char *const *ips, uint32_t count);
+int sandlock_ctx_restrict_net_allow(sandlock_ctx_t *ctx, const char *const *specs, uint32_t count);
 
 /**
  * Restrict max memory. Permanent.
@@ -1346,15 +1367,17 @@ void sandlock_ctx_restrict_max_memory(sandlock_ctx_t *ctx, uint64_t bytes);
 void sandlock_ctx_restrict_max_processes(sandlock_ctx_t *ctx, uint32_t n);
 
 /**
- * Restrict network for a specific PID.
+ * Narrow one process's network to `specs` on top of the live rules.
+ * Returns 0 or `-EINVAL`.
  *
  * # Safety
- * `ctx` must be a valid context pointer. `ips` must point to `count` C strings.
+ * `ctx` must be a valid context pointer from inside a policy callback.
+ * `specs` must point to `count` valid C strings.
  */
-void sandlock_ctx_restrict_pid_network(sandlock_ctx_t *ctx,
-                                       uint32_t pid,
-                                       const char *const *ips,
-                                       uint32_t count);
+int sandlock_ctx_restrict_pid_net_allow(sandlock_ctx_t *ctx,
+                                        uint32_t pid,
+                                        const char *const *specs,
+                                        uint32_t count);
 
 /**
  * Deny access to a path dynamically (checked on openat). Returns 0, or -1

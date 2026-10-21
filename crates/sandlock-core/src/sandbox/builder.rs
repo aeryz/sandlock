@@ -1124,6 +1124,26 @@ impl SandboxBuilder {
             net_allow.extend(NetRule::parse_allow(&s)?);
         }
 
+        let mut policy_fn = self.policy_fn;
+        if let Some(pf) = policy_fn.as_mut() {
+            let mut rules = Vec::new();
+            for s in pf.approvable.net_allow_specs().unwrap_or_default() {
+                rules.extend(NetRule::parse_allow(s)?);
+            }
+            // Only a network callback can answer a held operation; without one
+            // the approvable rules would loosen Landlock and never be granted.
+            if !rules.is_empty()
+                && !pf
+                    .events
+                    .contains(crate::policy_fn::SyscallCategory::Network)
+            {
+                return Err(SandboxError::Invalid(
+                    "approvable network rules need a policy_fn subscribed to network events".into(),
+                ));
+            }
+            pf.approvable_net_allow = rules;
+        }
+
         // Parse --net-deny rules, expanded the same way.
         let mut net_deny: Vec<NetDeny> = Vec::new();
         for s in self.net_deny {
@@ -1192,7 +1212,7 @@ impl SandboxBuilder {
             port_remap: self.port_remap,
             no_supervisor: self.no_supervisor,
             user: self.user,
-            policy_fn: self.policy_fn,
+            policy_fn,
             name: self.name,
             mode: self.mode,
             cow_upper: None,

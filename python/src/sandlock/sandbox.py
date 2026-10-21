@@ -190,6 +190,25 @@ class Image:
 _EVENT_CATEGORIES = {"filesystem": 1 << 0, "network": 1 << 1, "process": 1 << 2}
 
 
+@dataclass(frozen=True, kw_only=True)
+class Permissions:
+    """Permissions in the ``Sandbox`` vocabulary."""
+
+    net_allow: tuple[str, ...] = ()
+    """Rules in ``Sandbox.net_allow`` syntax."""
+
+    def __post_init__(self):
+        if isinstance(self.net_allow, (str, bytes)):
+            raise TypeError("net_allow must be a collection of specs, not a string")
+        object.__setattr__(self, "net_allow", tuple(self.net_allow))
+
+
+@dataclass(frozen=True, kw_only=True)
+class Grant(Permissions):
+    """A verdict that widens the live rules for good, within
+    ``PolicyFn.approvable``, then allows. Hostnames are not accepted."""
+
+
 @dataclass(frozen=True)
 class PolicyFn:
     """A policy callback and the timeout for its held verdicts."""
@@ -205,6 +224,9 @@ class PolicyFn:
     """Event categories delivered to the callback: ``"filesystem"``,
     ``"network"``, ``"process"``. Syscalls outside them are not intercepted for
     the callback and stay governed by the static policy."""
+    approvable: Permissions | None = field(default=None, kw_only=True)
+    """The most an approval may open beyond ``net_allow``. Destinations here
+    but not yet allowed are held for the callback instead of refused."""
 
     def __post_init__(self):
         if not callable(self.callback):
@@ -215,6 +237,8 @@ class PolicyFn:
         object.__setattr__(self, "events", frozenset(self.events))
         if not self.events or not self.events <= _EVENT_CATEGORIES.keys():
             raise ValueError(f"events must be a non-empty subset of {sorted(_EVENT_CATEGORIES)}")
+        if self.approvable is not None and not isinstance(self.approvable, Permissions):
+            raise TypeError("approvable must be a Permissions")
 
     def _events_mask(self) -> int:
         mask = 0

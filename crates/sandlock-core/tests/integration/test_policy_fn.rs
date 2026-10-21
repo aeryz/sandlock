@@ -1,7 +1,9 @@
-use sandlock_core::policy_fn::{PolicyFn, SyscallCategory, Verdict};
+use sandlock_core::policy_fn::{
+    Approval, Permissions, PolicyFn, PolicyFnError, SyscallCategory, Verdict,
+};
 use sandlock_core::sandbox::ByteSize;
 use sandlock_core::Sandbox;
-use std::net::{IpAddr, TcpListener};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -131,6 +133,7 @@ async fn test_policy_fn_deny_connect_does_not_leave_socket_connected() {
     listener.set_nonblocking(true).unwrap();
 
     let mut policy = base_policy()
+        .net_allow(format!("127.0.0.1:{port}"))
         .policy_fn(PolicyFn::new(|event, _ctx| {
             if event.syscall == "connect" {
                 Verdict::Deny
@@ -184,25 +187,23 @@ async fn test_policy_fn_deny_connect_does_not_leave_socket_connected() {
     );
 }
 
-/// restrict_network narrows outbound to the listed IPs and is enforced. The
-/// previous version called `restrict_network(&[])` — an empty list is a no-op —
-/// and connected to a dead port, so it verified nothing. Use two live loopback
-/// listeners (127.0.0.1 and 127.0.0.2), both allowlisted up front so either
-/// would connect; restricting to ["127.0.0.1"] must then permit the first and
-/// refuse the second (ECONNREFUSED, errno 111).
+/// restrict narrows outbound to the listed rules and is enforced. Two live
+/// loopback listeners are both allowlisted up front, so either would connect;
+/// restricting to 127.0.0.1 must permit the first and refuse the second
+/// (ECONNREFUSED, errno 111).
 #[tokio::test]
-async fn test_policy_fn_restrict_network_takes_effect() {
+async fn test_policy_fn_restrict_takes_effect() {
     let out = temp_file("restrict-net-effect");
     let (_l1, p1) = loopback_listener("127.0.0.1");
     let (_l2, p2) = loopback_listener("127.0.0.2");
 
-    let allowed: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap()];
     let policy = base_policy()
         .net_allow(format!("127.0.0.1:{p1}"))
         .net_allow(format!("127.0.0.2:{p2}"))
         .policy_fn(PolicyFn::new(move |event, ctx| {
             if event.syscall == "execve" {
-                ctx.restrict_network(&allowed); // narrow to 127.0.0.1
+                ctx.restrict(&Permissions::new().net_allow("127.0.0.1:*"))
+                    .unwrap();
             }
             Verdict::Allow
         }))
@@ -505,6 +506,7 @@ async fn test_policy_fn_network_events_only() {
     let denied_clone = denied.clone();
 
     let mut policy = base_policy()
+        .net_allow(format!("127.0.0.1:{port}"))
         .policy_fn(
             PolicyFn::new(move |event, ctx| {
                 if ctx.deny_path("/etc/hostname").is_ok() {
@@ -695,23 +697,19 @@ async fn test_policy_fn_audit() {
     );
 }
 
-/// restrict_pid_network blocks a pid's outbound even without a net_allow
-/// allowlist (policy_fn alone enables network interception). The previous
-/// version connected to a dead port and accepted any error, so it passed even
-/// if nothing was restricted. Target a *live* listener with no net_allow: the
-/// connect would succeed (network unrestricted by default under policy_fn), so
-/// the refusal can only come from restrict_pid_network([]).
+/// restrict_pid narrows one process below the live rules: the listener is
+/// allowlisted, so the refusal can only come from the per-process override.
 #[tokio::test]
-async fn test_policy_fn_restrict_pid_network_without_allowlist() {
+async fn test_policy_fn_restrict_pid_denies_connect() {
     let out = temp_file("restrict-pid-net");
     let (_listener, port) = loopback_listener("127.0.0.1");
 
-    // No net_allow: outbound is otherwise unrestricted; the callback restricts
-    // the exec'd pid's network to the empty set (deny all) on execve.
     let policy = base_policy()
+        .net_allow("127.0.0.1:*")
         .policy_fn(PolicyFn::new(move |event, ctx| {
             if event.syscall == "execve" {
-                ctx.restrict_pid_network(event.pid, &[]);
+                ctx.restrict_pid(event.pid, &Permissions::new().net_allow_none())
+                    .unwrap();
             }
             Verdict::Allow
         }))
@@ -746,7 +744,47 @@ async fn test_policy_fn_restrict_pid_network_without_allowlist() {
     // per-pid restriction.
     assert_eq!(
         content, "ERR111",
-        "restrict_pid_network([]) must deny the connect"
+        "restrict_pid with no rules must deny the connect"
+    );
+}
+
+/// With a policy_fn and no net_allow, nothing is reachable: the callback
+/// allowing every event must not open the network.
+#[tokio::test]
+async fn policy_fn_without_net_allow_denies_connect() {
+    let out = temp_file("policy-fn-no-net-allow");
+    let (listener, port) = loopback_listener("127.0.0.1");
+    listener.set_nonblocking(true).unwrap();
+
+    let mut policy = base_policy()
+        .policy_fn(PolicyFn::new(|_event, _ctx| Verdict::Allow))
+        .build()
+        .unwrap();
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('ERR%d' % e.errno)\n",
+        ),
+        port = port,
+        out = out.display()
+    );
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success());
+
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(content, "ERR111");
+    assert!(
+        listener.accept().is_err(),
+        "connect reached the listener without net_allow"
     );
 }
 
@@ -1463,4 +1501,426 @@ async fn deferred_approval_resolved_by_later_event() {
     let _ = std::fs::remove_file(&out);
     assert!(result.success());
     assert_eq!(content, "CONNECTED");
+}
+
+fn connect_probe(port: u16, out: &std::path::Path) -> String {
+    format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(3)\n",
+            "try:\n",
+            "  s.connect(('127.0.0.1', {port}))\n",
+            "  open('{out}', 'w').write('CONNECTED')\n",
+            "except OSError as e:\n",
+            "  open('{out}', 'w').write('ERR%d' % e.errno)\n",
+        ),
+        port = port,
+        out = out.display()
+    )
+}
+
+/// Approvable rules bound what an approval may open; on their own they open
+/// nothing. With only process events subscribed nobody can approve.
+#[tokio::test]
+async fn approvable_does_not_open_network_by_itself() {
+    let out = temp_file("approvable-closed");
+    let (listener, port) = loopback_listener("127.0.0.1");
+    listener.set_nonblocking(true).unwrap();
+    let mut policy = base_policy()
+        .policy_fn(
+            PolicyFn::new(|e, _c| {
+                if is_network_send(&e.syscall) {
+                    Verdict::Deny
+                } else {
+                    Verdict::Allow
+                }
+            })
+            .events(&[SyscallCategory::Network])
+            .approvable(Permissions::new().net_allow("*:*")),
+        )
+        .build()
+        .unwrap();
+    let script = connect_probe(port, &out);
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(content, "ERR111");
+    assert!(listener.accept().is_err(), "connect reached the listener");
+}
+
+/// The resolver needs UDP sockets, so an approvable sandbox that starts with
+/// no network must still be able to create them.
+#[tokio::test]
+async fn approvable_allows_udp_socket_creation() {
+    let out = temp_file("approvable-udp-socket");
+    let mut policy = base_policy()
+        .policy_fn(
+            PolicyFn::new(|_e, _c| Verdict::Allow)
+                .events(&[SyscallCategory::Network])
+                .approvable(Permissions::new().net_allow("*:*")),
+        )
+        .build()
+        .unwrap();
+    let script = format!(
+        "import socket\nsocket.socket(socket.AF_INET, socket.SOCK_DGRAM).close()\nopen('{}', 'w').write('OK')\n",
+        out.display()
+    );
+    let result = policy
+        .run_interactive(&["python3", "-c", &script])
+        .await
+        .unwrap();
+    assert!(result.success());
+    let content = std::fs::read_to_string(&out).unwrap_or_default();
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(content, "OK");
+}
+
+// ---------------------------------------------------------------------------
+// Approvable destinations held for approval
+// ---------------------------------------------------------------------------
+
+fn is_network_send(syscall: &str) -> bool {
+    matches!(syscall, "connect" | "sendto" | "sendmsg" | "sendmmsg")
+}
+
+/// A deferred callback that hands every held network operation to `answer`
+/// on another thread, and records whether live rules were empty at each one.
+fn approver(
+    answer: impl Fn(usize, Approval) + Send + 'static,
+) -> (PolicyFn, Arc<Mutex<Vec<bool>>>) {
+    let (tx, rx) = std::sync::mpsc::channel::<Approval>();
+    let tx = Mutex::new(tx);
+    let empty_live = Arc::new(Mutex::new(Vec::new()));
+    let seen = empty_live.clone();
+    std::thread::spawn(move || {
+        for (i, approval) in rx.iter().enumerate() {
+            answer(i, approval);
+        }
+    });
+    let policy_fn = PolicyFn::deferred(move |event, ctx, approval| {
+        let Some(approval) = approval else { return };
+        if is_network_send(&event.syscall) {
+            seen.lock()
+                .unwrap()
+                .push(ctx.current().net_allow.is_empty());
+            let _ = tx.lock().unwrap().send(approval);
+        } else {
+            approval.allow();
+        }
+    })
+    .events(&[SyscallCategory::Network])
+    .verdict_timeout(Some(Duration::from_secs(10)));
+    (policy_fn, empty_live)
+}
+
+fn connect_each(targets: &[(&str, u16)], out: &std::path::Path) -> String {
+    let targets: Vec<String> = targets
+        .iter()
+        .map(|(ip, port)| format!("('{ip}', {port})"))
+        .collect();
+    format!(
+        concat!(
+            "import socket\n",
+            "res = []\n",
+            "for t in [{targets}]:\n",
+            "  s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(5)\n",
+            "  try:\n",
+            "    s.connect(t); res.append('OK')\n",
+            "  except OSError as e:\n",
+            "    res.append('ERR%d' % e.errno)\n",
+            "  s.close()\n",
+            "open('{out}', 'w').write(' '.join(res))\n",
+        ),
+        targets = targets.join(", "),
+        out = out.display()
+    )
+}
+
+async fn run_script(policy: &mut Sandbox, script: &str, out: &std::path::Path) -> String {
+    let result = policy
+        .run_interactive(&["python3", "-c", script])
+        .await
+        .unwrap();
+    assert!(result.success());
+    let content = std::fs::read_to_string(out).unwrap_or_default();
+    let _ = std::fs::remove_file(out);
+    content
+}
+
+fn grant_first(specs: &'static str) -> impl Fn(usize, Approval) + Send + 'static {
+    move |i, approval| {
+        if i == 0 {
+            approval
+                .try_resolve(Verdict::Grant(Permissions::new().net_allow(specs)))
+                .expect("grant within approvable");
+        } else {
+            approval.allow();
+        }
+    }
+}
+
+#[tokio::test]
+async fn held_connect_granted_by_approval() {
+    let out = temp_file("held-granted");
+    let (_l, port) = loopback_listener("127.0.0.1");
+    let (policy_fn, empty_live) = approver(grant_first("127.0.0.1:*"));
+    let mut policy = base_policy()
+        .policy_fn(policy_fn.approvable(Permissions::new().net_allow("127.0.0.1:*")))
+        .build()
+        .unwrap();
+    let script = connect_each(&[("127.0.0.1", port), ("127.0.0.1", port)], &out);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "OK OK");
+    assert_eq!(*empty_live.lock().unwrap(), vec![true, false]);
+}
+
+#[tokio::test]
+async fn held_connect_allowed_once() {
+    let out = temp_file("held-once");
+    let (_l1, p1) = loopback_listener("127.0.0.1");
+    let (_l2, p2) = loopback_listener("127.0.0.1");
+    let (policy_fn, empty_live) = approver(|_, approval| approval.allow());
+    let mut policy = base_policy()
+        .policy_fn(policy_fn.approvable(Permissions::new().net_allow("127.0.0.1:*")))
+        .build()
+        .unwrap();
+    let script = connect_each(&[("127.0.0.1", p1), ("127.0.0.1", p2)], &out);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "OK OK");
+    assert_eq!(*empty_live.lock().unwrap(), vec![true, true]);
+}
+
+#[tokio::test]
+async fn held_connect_timeout_reaches_no_peer() {
+    let out = temp_file("held-timeout");
+    let (listener, port) = loopback_listener("127.0.0.1");
+    listener.set_nonblocking(true).unwrap();
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let keep = kept.clone();
+    let (policy_fn, _) = approver(move |_, approval| keep.lock().unwrap().push(approval));
+    let mut policy = base_policy()
+        .policy_fn(
+            policy_fn
+                .verdict_timeout(Some(Duration::from_millis(200)))
+                .approvable(Permissions::new().net_allow("127.0.0.1:*")),
+        )
+        .build()
+        .unwrap();
+    let script = connect_each(&[("127.0.0.1", port)], &out);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "ERR111");
+    assert!(
+        listener.accept().is_err(),
+        "timed-out connect reached the peer"
+    );
+}
+
+#[tokio::test]
+async fn connect_outside_approvable_stays_refused() {
+    let out = temp_file("outside-approvable");
+    let (_l, port) = loopback_listener("127.0.0.1");
+    let (policy_fn, _) = approver(|_, approval| approval.allow());
+    let mut policy = base_policy()
+        .policy_fn(policy_fn.approvable(Permissions::new().net_allow("127.0.0.1:1")))
+        .build()
+        .unwrap();
+    let script = connect_each(&[("127.0.0.1", port)], &out);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "ERR111");
+}
+
+#[tokio::test]
+async fn grant_outside_approvable_denies() {
+    let out = temp_file("grant-outside");
+    let (_l, port) = loopback_listener("127.0.0.1");
+    let refused = Arc::new(Mutex::new(Vec::new()));
+    let record = refused.clone();
+    let (policy_fn, _) = approver(move |_, approval| {
+        let result =
+            approval.try_resolve(Verdict::Grant(Permissions::new().net_allow("10.0.0.0/8:*")));
+        record
+            .lock()
+            .unwrap()
+            .push(matches!(result, Err(PolicyFnError::NotApprovable(_))));
+    });
+    let mut policy = base_policy()
+        .policy_fn(policy_fn.approvable(Permissions::new().net_allow("127.0.0.1:*")))
+        .build()
+        .unwrap();
+    let script = connect_each(&[("127.0.0.1", port)], &out);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "ERR111");
+    assert_eq!(*refused.lock().unwrap(), vec![true]);
+}
+
+#[tokio::test]
+async fn grant_after_restrict_denies() {
+    let out = temp_file("grant-restricted");
+    let (_l, port) = loopback_listener("127.0.0.1");
+    let (tx, rx) = std::sync::mpsc::channel::<Approval>();
+    let tx = Mutex::new(tx);
+    let refused = Arc::new(Mutex::new(Vec::new()));
+    let record = refused.clone();
+    std::thread::spawn(move || {
+        for approval in rx.iter() {
+            let result =
+                approval.try_resolve(Verdict::Grant(Permissions::new().net_allow("127.0.0.1:*")));
+            record
+                .lock()
+                .unwrap()
+                .push(matches!(result, Err(PolicyFnError::NotApprovable(_))));
+        }
+    });
+    let mut policy = base_policy()
+        .policy_fn(
+            PolicyFn::deferred(move |event, ctx, approval| {
+                let Some(approval) = approval else { return };
+                if event.syscall == "connect" {
+                    ctx.restrict(&Permissions::new().net_allow("127.0.0.1:1"))
+                        .unwrap();
+                    let _ = tx.lock().unwrap().send(approval);
+                } else {
+                    approval.allow();
+                }
+            })
+            .events(&[SyscallCategory::Network])
+            .approvable(Permissions::new().net_allow("127.0.0.1:*")),
+        )
+        .build()
+        .unwrap();
+    let script = connect_each(&[("127.0.0.1", port)], &out);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "ERR111");
+    assert_eq!(*refused.lock().unwrap(), vec![true]);
+}
+
+#[tokio::test]
+async fn sync_callback_grant_opens_network() {
+    let out = temp_file("sync-grant");
+    let (_l1, p1) = loopback_listener("127.0.0.1");
+    let (_l2, p2) = loopback_listener("127.0.0.1");
+    let empty_live = Arc::new(Mutex::new(Vec::new()));
+    let seen = empty_live.clone();
+    let mut policy = base_policy()
+        .policy_fn(
+            PolicyFn::new(move |event, ctx| {
+                if !is_network_send(&event.syscall) {
+                    return Verdict::Allow;
+                }
+                let empty = ctx.current().net_allow.is_empty();
+                seen.lock().unwrap().push(empty);
+                if empty {
+                    Verdict::Grant(Permissions::new().net_allow("127.0.0.1:*"))
+                } else {
+                    Verdict::Allow
+                }
+            })
+            .events(&[SyscallCategory::Network])
+            .approvable(Permissions::new().net_allow("127.0.0.1:*")),
+        )
+        .build()
+        .unwrap();
+    let script = connect_each(&[("127.0.0.1", p1), ("127.0.0.1", p2)], &out);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "OK OK");
+    assert_eq!(*empty_live.lock().unwrap(), vec![true, false]);
+}
+
+#[tokio::test]
+async fn net_deny_wins_over_grant() {
+    let out = temp_file("deny-wins-grant");
+    let (_l1, p1) = loopback_listener("127.0.0.1");
+    let (_l2, p2) = loopback_listener("127.0.0.2");
+    let (policy_fn, _) = approver(grant_first("*:*"));
+    let mut policy = base_policy()
+        .net_deny("127.0.0.2")
+        .policy_fn(policy_fn.approvable(Permissions::new().net_allow("*:*")))
+        .build()
+        .unwrap();
+    let script = connect_each(&[("127.0.0.1", p1), ("127.0.0.2", p2)], &out);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "OK ERR111");
+}
+
+#[tokio::test]
+async fn held_udp_sendto_granted() {
+    let out = temp_file("held-udp");
+    let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let port = receiver.local_addr().unwrap().port();
+    let (policy_fn, _) = approver(grant_first("udp://127.0.0.1:*"));
+    let mut policy = base_policy()
+        .policy_fn(policy_fn.approvable(Permissions::new().net_allow("udp://127.0.0.1:*")))
+        .build()
+        .unwrap();
+    let script = format!(
+        concat!(
+            "import socket\n",
+            "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+            "s.sendto(b'hi', ('127.0.0.1', {port}))\n",
+            "open('{out}', 'w').write('SENT')\n",
+        ),
+        port = port,
+        out = out.display()
+    );
+    assert_eq!(run_script(&mut policy, &script, &out).await, "SENT");
+    let mut buf = [0; 2];
+    assert_eq!(receiver.recv_from(&mut buf).unwrap().0, 2);
+    assert_eq!(&buf, b"hi");
+}
+
+#[tokio::test]
+async fn held_sendmmsg_mixed_batch() {
+    let out = temp_file("held-sendmmsg");
+    let r1 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let r2 = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    for r in [&r1, &r2] {
+        r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    }
+    let (p1, p2) = (
+        r1.local_addr().unwrap().port(),
+        r2.local_addr().unwrap().port(),
+    );
+    let approvals = Arc::new(Mutex::new(0));
+    let count = approvals.clone();
+    let (policy_fn, _) = approver(move |_, approval| {
+        *count.lock().unwrap() += 1;
+        approval.allow();
+    });
+    let mut policy = base_policy()
+        .net_allow(format!("udp://127.0.0.1:{p1}"))
+        .policy_fn(policy_fn.approvable(Permissions::new().net_allow("udp://127.0.0.1:*")))
+        .build()
+        .unwrap();
+    let script = format!(concat!(
+        "import ctypes, socket, struct\n",
+        "libc = ctypes.CDLL('libc.so.6', use_errno=True)\n",
+        "class iovec(ctypes.Structure):\n",
+        "    _fields_ = [('iov_base', ctypes.c_void_p), ('iov_len', ctypes.c_size_t)]\n",
+        "class msghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_name', ctypes.c_void_p), ('msg_namelen', ctypes.c_uint), ('_p1', ctypes.c_uint),\n",
+        "        ('msg_iov', ctypes.c_void_p), ('msg_iovlen', ctypes.c_size_t), ('msg_control', ctypes.c_void_p),\n",
+        "        ('msg_controllen', ctypes.c_size_t), ('msg_flags', ctypes.c_int), ('_p2', ctypes.c_uint)]\n",
+        "class mmsghdr(ctypes.Structure):\n",
+        "    _fields_ = [('msg_hdr', msghdr), ('msg_len', ctypes.c_uint), ('_p', ctypes.c_uint)]\n",
+        "def sai(port):\n",
+        "    return struct.pack('=HH4s8x', socket.AF_INET, socket.htons(port), socket.inet_aton('127.0.0.1'))\n",
+        "s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)\n",
+        "addrs = [ctypes.create_string_buffer(sai(p)) for p in ({p1}, {p2})]\n",
+        "data = ctypes.create_string_buffer(b'x')\n",
+        "iovs = (iovec * 2)()\n",
+        "vec = (mmsghdr * 2)()\n",
+        "for i in range(2):\n",
+        "    iovs[i].iov_base = ctypes.cast(data, ctypes.c_void_p).value\n",
+        "    iovs[i].iov_len = 1\n",
+        "    vec[i].msg_hdr.msg_name = ctypes.cast(addrs[i], ctypes.c_void_p).value\n",
+        "    vec[i].msg_hdr.msg_namelen = 16\n",
+        "    vec[i].msg_hdr.msg_iov = ctypes.cast(ctypes.pointer(iovs[i]), ctypes.c_void_p).value\n",
+        "    vec[i].msg_hdr.msg_iovlen = 1\n",
+        "ret = libc.sendmmsg(s.fileno(), vec, 2, 0)\n",
+        "open('{out}', 'w').write(f'ret={{ret}}')\n",
+    ), out = out.display(), p1 = p1, p2 = p2);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "ret=2");
+    let mut buf = [0; 1];
+    assert!(r1.recv_from(&mut buf).is_ok());
+    assert!(r2.recv_from(&mut buf).is_ok());
+    assert_eq!(*approvals.lock().unwrap(), 1);
 }

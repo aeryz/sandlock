@@ -569,10 +569,10 @@ pub struct NetworkState {
     /// denylist). The on-behalf `bind()` handler rejects a TCP bind to any
     /// port in this set with `EACCES`; empty = no bind denylist.
     pub bind_deny_ports: HashSet<u16>,
-    /// Per-PID network overrides from policy_fn (IP-only via the legacy
-    /// `restrict_network(ips)` API; any port is permitted to listed IPs).
-    pub pid_ip_overrides:
-        std::sync::Arc<std::sync::RwLock<HashMap<u32, HashSet<std::net::IpAddr>>>>,
+    /// Per-process network rules from `PolicyContext::restrict_pid`, applied
+    /// on top of the live policy.
+    pub pid_net_overrides:
+        std::sync::Arc<std::sync::RwLock<HashMap<u32, crate::network::NetRuleSet>>>,
     /// HTTP ACL proxy address (None if HTTP ACL not active).
     pub http_acl_addr: Option<std::net::SocketAddr>,
     /// TCP ports to intercept and redirect to the HTTP ACL proxy.
@@ -593,7 +593,7 @@ impl NetworkState {
             port_map: crate::port_remap::PortMap::new(),
             bind_allow_ports: Some(crate::sandbox::BindPorts::default()),
             bind_deny_ports: HashSet::new(),
-            pid_ip_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            pid_net_overrides: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
             http_acl_addr: None,
             http_acl_ports: HashSet::new(),
             http_acl_orig_dest: None,
@@ -603,12 +603,35 @@ impl NetworkState {
     /// Get the effective allow and deny policy layers for the task `tid` and
     /// protocol.
     ///
-    /// Allow resolution keeps the legacy `policy_fn` priority: per-PID
-    /// override > live policy (when non-empty) > static per-protocol
-    /// allowlist. PID/live overrides are IP-only, any port is permitted to
-    /// listed IPs, and apply across all protocols. Deny is always the
-    /// static per-protocol denylist, applied after the allow verdict with
-    /// deny always winning, so a dynamic override can never erase it.
+    /// With a `policy_fn`, the live rules replace the static allowlist, so an
+    /// empty live set denies everything; a per-process override narrows them
+    /// further. Deny is always the static per-protocol denylist, applied after
+    /// the allow verdict, so a dynamic rule can never erase it.
+    fn pid_net_rules(&self, tid: u32) -> Option<crate::network::NetRuleSet> {
+        let overrides = self.pid_net_overrides.read().ok()?;
+        if overrides.is_empty() {
+            return None;
+        }
+        // Overrides are keyed by process; the notification names a thread.
+        let tgid = read_tgid_of_tid(tid as i32).map_or(tid, |t| t as u32);
+        overrides.get(&tgid).cloned()
+    }
+
+    /// What an approval could still open for `tid`: the approvable rules,
+    /// narrowed by its per-process override.
+    pub(crate) fn approvable_network_policy(
+        &self,
+        tid: u32,
+        protocol: crate::sandbox::Protocol,
+        live_policy: &std::sync::RwLock<crate::policy_fn::LivePolicy>,
+    ) -> crate::seccomp::notif::NetworkPolicy {
+        let live = live_policy.read().unwrap();
+        match self.pid_net_rules(tid) {
+            Some(pid) => live.net_approvable.intersect(&pid).policy(protocol),
+            None => live.net_approvable.policy(protocol),
+        }
+    }
+
     pub(crate) fn effective_network_policy(
         &self,
         tid: u32,
@@ -616,41 +639,21 @@ impl NetworkState {
         live_policy: Option<&std::sync::Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>>>,
     ) -> NetworkPolicyLayers {
         use crate::sandbox::Protocol;
-        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
         let deny = match protocol {
             Protocol::Tcp => self.tcp_deny_policy.clone(),
             Protocol::Udp => self.udp_deny_policy.clone(),
             Protocol::Icmp => self.icmp_deny_policy.clone(),
         };
-        let ip_only_allow = |ips: &HashSet<std::net::IpAddr>| {
-            let per_ip = ips.iter().map(|&ip| (ip, PortAllow::Any)).collect();
-            NetworkPolicy::AllowList {
-                per_ip,
-                cidrs: Vec::new(),
-                any_ip_ports: HashSet::new(),
-            }
+        let pid_rules = self.pid_net_rules(tid);
+        let live = live_policy.and_then(|lp| lp.read().ok());
+        let dynamic = match (live.as_ref(), pid_rules) {
+            (Some(live), Some(pid)) => Some(live.net_allow.intersect(&pid).policy(protocol)),
+            (Some(live), None) => Some(live.net_allow.policy(protocol)),
+            (None, Some(pid)) => Some(pid.policy(protocol)),
+            (None, None) => None,
         };
-        if let Ok(overrides) = self.pid_ip_overrides.read() {
-            // Overrides are keyed by process; the notification names a thread.
-            if !overrides.is_empty() {
-                let tgid = read_tgid_of_tid(tid as i32).map_or(tid, |t| t as u32);
-                if let Some(ips) = overrides.get(&tgid) {
-                    return NetworkPolicyLayers {
-                        allow: ip_only_allow(ips),
-                        deny,
-                    };
-                }
-            }
-        }
-        if let Some(lp) = live_policy {
-            if let Ok(live) = lp.read() {
-                if !live.allowed_ips.is_empty() {
-                    return NetworkPolicyLayers {
-                        allow: ip_only_allow(&live.allowed_ips),
-                        deny,
-                    };
-                }
-            }
+        if let Some(allow) = dynamic {
+            return NetworkPolicyLayers { allow, deny };
         }
         let allow = match protocol {
             Protocol::Tcp => self.tcp_policy.clone(),
@@ -1095,10 +1098,10 @@ mod tests {
         let ns = NetworkState::new();
         let tgid = std::process::id();
         let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        ns.pid_ip_overrides
+        ns.pid_net_overrides
             .write()
             .unwrap()
-            .insert(tgid, HashSet::from([ip]));
+            .insert(tgid, net_rules(&["10.0.0.1:*"]));
 
         let layers = std::thread::spawn(move || {
             let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
@@ -1108,10 +1111,11 @@ mod tests {
         .join()
         .unwrap();
 
-        match layers.allow {
-            NetworkPolicy::AllowList { per_ip, .. } => assert!(per_ip.contains_key(&ip)),
-            other => panic!("override ignored for a non-leader thread: {other:?}"),
-        }
+        assert!(
+            layers.allow.allows(ip, 443) && !layers.allow.allows("10.0.0.2".parse().unwrap(), 443),
+            "override ignored for a non-leader thread: {:?}",
+            layers.allow
+        );
         assert!(matches!(layers.deny, NetworkPolicy::Unrestricted));
     }
 
@@ -1127,10 +1131,10 @@ mod tests {
             deny_all: false,
         };
         let allowed_by_override: std::net::IpAddr = "10.1.2.3".parse().unwrap();
-        ns.pid_ip_overrides
+        ns.pid_net_overrides
             .write()
             .unwrap()
-            .insert(std::process::id(), HashSet::from([allowed_by_override]));
+            .insert(std::process::id(), net_rules(&["10.1.2.3:*"]));
 
         let layers =
             ns.effective_network_policy(std::process::id(), crate::sandbox::Protocol::Tcp, None);
@@ -1140,58 +1144,77 @@ mod tests {
         assert!(!layers.deny.allows(allowed_by_override, 443));
     }
 
-    #[test]
-    fn empty_live_policy_falls_back_to_static_allow() {
-        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
+    fn net_rules(specs: &[&str]) -> crate::network::NetRuleSet {
+        crate::network::NetRuleSet::parse_literal(specs).unwrap()
+    }
 
-        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let mut ns = NetworkState::new();
+    fn live_with(allow: &[&str]) -> Arc<std::sync::RwLock<crate::policy_fn::LivePolicy>> {
+        Arc::new(std::sync::RwLock::new(crate::policy_fn::LivePolicy {
+            net_allow: net_rules(allow),
+            net_approvable: net_rules(&["*:*"]),
+            max_memory_bytes: 0,
+            max_processes: 0,
+        }))
+    }
+
+    fn static_allow_443(ns: &mut NetworkState, ip: std::net::IpAddr) {
+        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
         ns.tcp_policy = NetworkPolicy::AllowList {
             per_ip: HashMap::from([(ip, PortAllow::Specific(HashSet::from([443])))]),
             cidrs: Vec::new(),
             any_ip_ports: HashSet::new(),
         };
-        let live = Arc::new(std::sync::RwLock::new(crate::policy_fn::LivePolicy {
-            allowed_ips: HashSet::new(),
-            max_memory_bytes: 0,
-            max_processes: 0,
-        }));
-
-        let layers = ns.effective_network_policy(
-            std::process::id(),
-            crate::sandbox::Protocol::Tcp,
-            Some(&live),
-        );
-        assert!(layers.allow.allows(ip, 443));
-        assert!(!layers.allow.allows(ip, 80));
     }
 
     #[test]
-    fn live_policy_replaces_static_allow_with_ip_only_grant() {
-        use crate::seccomp::notif::{NetworkPolicy, PortAllow};
-
+    fn empty_live_policy_denies_everything() {
         let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
         let mut ns = NetworkState::new();
-        ns.tcp_policy = NetworkPolicy::AllowList {
-            per_ip: HashMap::from([(ip, PortAllow::Specific(HashSet::from([443])))]),
-            cidrs: Vec::new(),
-            any_ip_ports: HashSet::new(),
-        };
-        let live = Arc::new(std::sync::RwLock::new(crate::policy_fn::LivePolicy {
-            allowed_ips: HashSet::from([ip]),
-            max_memory_bytes: 0,
-            max_processes: 0,
-        }));
+        static_allow_443(&mut ns, ip);
+        let live = live_with(&[]);
 
         let layers = ns.effective_network_policy(
             std::process::id(),
             crate::sandbox::Protocol::Tcp,
             Some(&live),
         );
-        // Legacy semantics: a non-empty live set replaces the static allow
-        // with an IP-only grant (any port to the listed IP).
-        assert!(layers.allow.allows(ip, 443));
+        assert!(!layers.allow.allows(ip, 443));
+    }
+
+    #[test]
+    fn live_policy_keeps_granted_ports() {
+        let ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let mut ns = NetworkState::new();
+        static_allow_443(&mut ns, ip);
+        let live = live_with(&["127.0.0.1:80"]);
+
+        let layers = ns.effective_network_policy(
+            std::process::id(),
+            crate::sandbox::Protocol::Tcp,
+            Some(&live),
+        );
         assert!(layers.allow.allows(ip, 80));
+        assert!(!layers.allow.allows(ip, 443));
+    }
+
+    #[test]
+    fn pid_override_narrows_live_policy() {
+        let mut ns = NetworkState::new();
+        static_allow_443(&mut ns, "127.0.0.1".parse().unwrap());
+        let live = live_with(&["127.0.0.1:*"]);
+        ns.pid_net_overrides
+            .write()
+            .unwrap()
+            .insert(std::process::id(), net_rules(&["*:443"]));
+
+        let layers = ns.effective_network_policy(
+            std::process::id(),
+            crate::sandbox::Protocol::Tcp,
+            Some(&live),
+        );
+        assert!(layers.allow.allows("127.0.0.1".parse().unwrap(), 443));
+        assert!(!layers.allow.allows("127.0.0.1".parse().unwrap(), 80));
+        assert!(!layers.allow.allows("10.0.0.1".parse().unwrap(), 443));
     }
 
     #[test]

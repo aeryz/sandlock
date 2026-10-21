@@ -10,10 +10,10 @@ package sandlock
 //
 // The C declarations come from the cbindgen-generated header, so the cgo
 // prototypes stay in lock-step with crates/sandlock-ffi automatically.
+#include <errno.h>
 #include <stdlib.h>
 #include "sandlock.h"
 
-extern int32_t goPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, void *user_data);
 extern void goDeferredPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, sandlock_approval_t *approval, void *user_data);
 extern void goPolicyDrop(void *user_data);
 */
@@ -97,25 +97,6 @@ func policyEventFromC(ev *C.sandlock_event_t) SyscallEvent {
 	return out
 }
 
-//export goPolicyCallback
-func goPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, userData unsafe.Pointer) (ret C.int32_t) {
-	ret = C.int32_t(DecisionDeny)
-	defer func() {
-		if recover() != nil {
-			ret = C.int32_t(DecisionDeny)
-		}
-	}()
-
-	fn, ok := policyCallbacks.Load(policyCallbackID(userData))
-	if !ok {
-		return C.int32_t(DecisionDeny)
-	}
-	decision := fn.(PolicyFunc)(policyEventFromC(event), &PolicyContext{
-		ptr: unsafe.Pointer(ctx),
-	})
-	return C.int32_t(decision)
-}
-
 //export goDeferredPolicyCallback
 func goDeferredPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, approval *C.sandlock_approval_t, userData unsafe.Pointer) {
 	var a *Approval
@@ -137,14 +118,25 @@ func goDeferredPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, 
 	fn.(DeferredPolicyFunc)(policyEventFromC(event), &PolicyContext{ptr: unsafe.Pointer(ctx)}, a)
 }
 
-// Resolve answers the held syscall with decision.
+// Resolve answers the held syscall with decision. A refused Grant denies
+// the syscall and returns ErrNotApprovable, ErrInvalidRule or
+// ErrInvalidString.
 func (a *Approval) Resolve(decision PolicyDecision) error {
-	ptr := a.take()
+	ptr := (*C.sandlock_approval_t)(a.take())
 	if ptr == nil {
 		return ErrApprovalAnswered
 	}
-	C.sandlock_approval_resolve((*C.sandlock_approval_t)(ptr), C.int32_t(decision))
-	return nil
+	if decision.grant == nil {
+		C.sandlock_approval_resolve(ptr, C.int32_t(decision.code))
+		return nil
+	}
+	err := withNetAllow(decision.grant.NetAllow, func(specs **C.char, n C.uint32_t) C.int {
+		return C.sandlock_approval_grant_net_allow(ptr, specs, n)
+	})
+	if err == ErrInvalidString {
+		C.sandlock_approval_resolve(ptr, C.int32_t(Deny().code))
+	}
+	return err
 }
 
 // IsCancelled reports that shutdown or the verdict timeout already decided
@@ -188,6 +180,7 @@ func (s *Sandbox) validateStrings() error {
 		s.NetAllow, s.NetDeny, s.NetAllowBind, s.NetDenyBind,
 		s.HTTPAllow, s.HTTPDeny,
 		s.ExtraAllowSyscalls, s.ExtraDenySyscalls,
+		s.approvableNetAllow(),
 		{s.Workdir, s.Cwd, s.Chroot, s.FSStorage, s.MaxMemory, s.MaxDisk,
 			s.TimeStart, s.HTTPCAFile, s.HTTPKeyFile, s.Name},
 	}
@@ -221,6 +214,13 @@ func (s *Sandbox) validateStrings() error {
 		}
 	}
 	return nil
+}
+
+func (s *Sandbox) approvableNetAllow() []string {
+	if s.PolicyFn == nil || s.PolicyFn.Approvable == nil {
+		return nil
+	}
+	return s.PolicyFn.Approvable.NetAllow
 }
 
 // buildPolicy translates the Sandbox configuration into a native policy handle.
@@ -473,24 +473,30 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 				events |= 1 << category
 			}
 		}
-		if s.PolicyFn.Deferred != nil {
-			b = C.sandlock_sandbox_builder_policy_fn_deferred(
-				b,
-				(C.sandlock_policy_deferred_fn_t)(C.goDeferredPolicyCallback),
-				C.int64_t(timeoutMs),
-				events,
-				registerPolicyCallback(s.PolicyFn.Deferred),
-				(*[0]byte)(C.goPolicyDrop),
-			)
-		} else {
-			b = C.sandlock_sandbox_builder_policy_fn(
-				b,
-				(C.sandlock_policy_fn_t)(C.goPolicyCallback),
-				C.int64_t(timeoutMs),
-				events,
-				registerPolicyCallback(s.PolicyFn.Callback),
-				(*[0]byte)(C.goPolicyDrop),
-			)
+		deferred := s.PolicyFn.Deferred
+		if deferred == nil {
+			// Answered through the approval so a returned Grant can apply.
+			callback := s.PolicyFn.Callback
+			deferred = func(event SyscallEvent, ctx *PolicyContext, approval *Approval) {
+				decision := callback(event, ctx)
+				if approval != nil {
+					_ = approval.Resolve(decision)
+				}
+			}
+		}
+		b = C.sandlock_sandbox_builder_policy_fn_deferred(
+			b,
+			(C.sandlock_policy_deferred_fn_t)(C.goDeferredPolicyCallback),
+			C.int64_t(timeoutMs),
+			events,
+			registerPolicyCallback(deferred),
+			(*[0]byte)(C.goPolicyDrop),
+		)
+		if s.PolicyFn.Approvable != nil {
+			cspecs, _ := cStringArray(s.PolicyFn.Approvable.NetAllow)
+			ptr, n := cStringArrayPtr(cspecs)
+			b = C.sandlock_sandbox_builder_approvable_net_allow(b, ptr, n)
+			freeArgv(cspecs)
 		}
 	}
 
@@ -582,28 +588,11 @@ func (c *PolicyContext) IsCancelled() bool {
 	return bool(C.sandlock_ctx_is_cancelled(c.cptr()))
 }
 
-// RestrictNetwork permanently restricts the live network policy to ips.
-func (c *PolicyContext) RestrictNetwork(ips []string) error {
-	cips, err := cStringArray(ips)
-	if err != nil {
-		return err
-	}
-	defer freeArgv(cips)
-	ptr, n := cStringArrayPtr(cips)
-	C.sandlock_ctx_restrict_network(c.cptr(), ptr, n)
-	return nil
-}
-
-// GrantNetwork grants ips within the sandbox's immutable network ceiling.
-func (c *PolicyContext) GrantNetwork(ips []string) error {
-	cips, err := cStringArray(ips)
-	if err != nil {
-		return err
-	}
-	defer freeArgv(cips)
-	ptr, n := cStringArrayPtr(cips)
-	C.sandlock_ctx_grant_network(c.cptr(), ptr, n)
-	return nil
+// Restrict permanently narrows the live and approvable network rules to p.
+func (c *PolicyContext) Restrict(p Permissions) error {
+	return withNetAllow(p.NetAllow, func(specs **C.char, n C.uint32_t) C.int {
+		return C.sandlock_ctx_restrict_net_allow(c.cptr(), specs, n)
+	})
 }
 
 // RestrictMaxMemory permanently restricts the live max-memory policy.
@@ -616,16 +605,28 @@ func (c *PolicyContext) RestrictMaxProcesses(n uint32) {
 	C.sandlock_ctx_restrict_max_processes(c.cptr(), C.uint32_t(n))
 }
 
-// RestrictPIDNetwork restricts network access for a specific process.
-func (c *PolicyContext) RestrictPIDNetwork(pid uint32, ips []string) error {
-	cips, err := cStringArray(ips)
+// RestrictPID narrows one process's network below the live rules.
+func (c *PolicyContext) RestrictPID(pid uint32, p Permissions) error {
+	return withNetAllow(p.NetAllow, func(specs **C.char, n C.uint32_t) C.int {
+		return C.sandlock_ctx_restrict_pid_net_allow(c.cptr(), C.uint32_t(pid), specs, n)
+	})
+}
+
+func withNetAllow(specs []string, call func(**C.char, C.uint32_t) C.int) error {
+	cspecs, err := cStringArray(specs)
 	if err != nil {
 		return err
 	}
-	defer freeArgv(cips)
-	ptr, n := cStringArrayPtr(cips)
-	C.sandlock_ctx_restrict_pid_network(c.cptr(), C.uint32_t(pid), ptr, n)
-	return nil
+	defer freeArgv(cspecs)
+	ptr, n := cStringArrayPtr(cspecs)
+	switch rc := call(ptr, n); rc {
+	case 0:
+		return nil
+	case -C.EPERM:
+		return ErrNotApprovable
+	default:
+		return ErrInvalidRule
+	}
 }
 
 // DenyPath dynamically denies access to path for mediated openat checks.

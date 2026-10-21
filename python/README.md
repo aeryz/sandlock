@@ -709,17 +709,17 @@ Methods available inside `policy_fn`:
 
 | Method | Description |
 |--------|-------------|
-| `ctx.restrict_network(ips)` | Restrict to given IP addresses |
-| `ctx.grant_network(ips)` | Allow additional IP addresses up to the static network ceiling |
+| `ctx.restrict(net_allow=specs)` | Narrow the live and approvable network rules |
 | `ctx.restrict_max_memory(bytes)` | Lower memory limit |
 | `ctx.restrict_max_processes(n)` | Lower process limit |
-| `ctx.restrict_pid_network(pid, ips)` | Per-PID network restriction |
+| `ctx.restrict_pid(pid, net_allow=specs)` | Narrow one process below the live rules |
 | `ctx.deny_path(path)` | Deny access to a path |
 | `ctx.allow_path(path)` | Remove a previously denied path |
 
-Dynamic IP restrictions resolve with legacy priority (per-PID override > live
-policy > static allowlist); the static `net_deny` layer is checked after the
-allow verdict and always wins, so a dynamic override can never erase it.
+Runtime specs take IPs and CIDRs only. Widening the network happens by
+answering with `Grant(net_allow=specs)` within `PolicyFn(approvable=Permissions(...))`;
+see [approve network on demand](../docs/policy-fn.md#approve-network-on-demand).
+The static `net_deny` layer is checked after the allow verdict and always wins.
 
 Callback return values:
 
@@ -729,6 +729,7 @@ Callback return values:
 | `True`, `-1` | Deny (EPERM) |
 | positive `int` | Deny with that errno |
 | `"audit"`, `-2` | Allow but flag for audit |
+| `Grant(net_allow=specs)` | Widen the network within `approvable`, then allow |
 
 ### Fork
 

@@ -13,6 +13,13 @@ var ErrNotRunning = errors.New("sandlock: process is not running")
 // ErrApprovalAnswered is returned when an Approval is resolved twice.
 var ErrApprovalAnswered = errors.New("sandlock: approval already answered")
 
+// ErrNotApprovable reports a grant outside the PolicyFn's approvable rules.
+var ErrNotApprovable = errors.New("sandlock: outside the approvable rules")
+
+// ErrInvalidRule reports a malformed net_allow rule, or a hostname where only
+// IPs and CIDRs are accepted.
+var ErrInvalidRule = errors.New("sandlock: invalid net_allow rule")
+
 // ErrFilesystemEventsRequired is returned by PolicyContext.DenyPath when the
 // PolicyFn does not subscribe to CategoryFilesystem.
 var ErrFilesystemEventsRequired = errors.New("sandlock: policy_fn does not subscribe to filesystem events")

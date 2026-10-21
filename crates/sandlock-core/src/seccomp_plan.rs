@@ -626,9 +626,10 @@ pub(crate) fn arg_filters_resolved(resolved: &ResolvedSandbox) -> Vec<SockFilter
     // address-sorting probes (connect, never send), and blocking those
     // breaks name resolution for TCP-only rule sets. Gating stays at
     // socket() only for the no-rules sandbox, where nothing traps sends.
-    // This must NOT widen to HTTP-ACL-only or policy_fn-only configs:
-    // their empty net_allow resolves the UDP policy to Unrestricted, so
-    // creation would mean unrestricted UDP egress.
+    // This must NOT widen to HTTP-ACL-only configs: their empty net_allow
+    // resolves the UDP policy to Unrestricted, so creation would mean
+    // unrestricted UDP egress. Approvable rules count: their destinations
+    // are held for approval, so the socket must exist to be approved.
     let mut blocked_types: Vec<u32> = Vec::new();
     blocked_types.push(SOCK_RAW);
     if !features.net_allow_present && !features.net_deny {

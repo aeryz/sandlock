@@ -30,6 +30,7 @@ use crate::sys::structs::SeccompNotif;
 
 mod connect;
 pub(crate) mod materialize;
+mod rule_set;
 mod rules;
 mod send;
 mod send_engine;
@@ -41,9 +42,11 @@ mod verdict;
 // signatures (callers bind them by inference), which trips unused_imports.
 #[allow(unused_imports)]
 pub use rules::{
-    compose_virtual_etc_hosts, resolve_net_allow, resolve_net_deny, IpCidr, NetAllow, NetDeny,
+    compose_virtual_etc_hosts, resolve_net_allow_pair, resolve_net_deny, IpCidr, NetAllow, NetDeny,
     NetRule, NetTarget, Protocol, ResolvedNetAllow, ResolvedNetAllowSet, ResolvedNetDenySet,
 };
+
+pub use rule_set::NetRuleSet;
 
 use connect::connect_on_behalf;
 use send::{sendmmsg_on_behalf, sendmsg_on_behalf, sendto_on_behalf};

@@ -39,11 +39,8 @@ pub(crate) fn destination_verdict(
 }
 
 /// Resolve order: effective allow first, then the immutable static deny.
-/// Allow already carries legacy dynamic resolution (per-PID override > live
-/// policy > static per-protocol allowlist). Deny is always the static
-/// per-protocol denylist and wins second, including when the effective allow
-/// is `Unrestricted` or comes from a `policy_fn`/per-PID override. No
-/// dynamic/static allow intersection is performed.
+/// Deny is always the static per-protocol denylist and wins second, including
+/// when the effective allow is `Unrestricted` or comes from a `policy_fn`.
 pub(crate) fn layered_destination_verdict(
     effective: &NetworkPolicyLayers,
     ip: IpAddr,
@@ -59,25 +56,78 @@ pub(crate) fn layered_destination_verdict(
     Ok(())
 }
 
-/// Resolve the effective per-protocol allow/deny layers for `pid` and apply
-/// [`layered_destination_verdict`]. Shared by the sendto and sendmsg handlers;
-/// connect keeps its own `ns` borrow alive for HTTP-ACL and port-remap
-/// reads, so it calls [`layered_destination_verdict`] directly.
+/// How the on-behalf path treats one IP destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Destination {
+    Allowed,
+    /// Approvable but not yet allowed: hold it for the callback's answer.
+    Held,
+    Rejected(i32),
+}
+
+/// Classify a destination against the effective layers and, when an
+/// approval could open it, the approvable rules. Pure: no I/O, no locks.
+pub(crate) fn classify(
+    effective: &NetworkPolicyLayers,
+    approvable: Option<&NetworkPolicy>,
+    ip: IpAddr,
+    port: Option<u16>,
+) -> Destination {
+    let Err(errno) = layered_destination_verdict(effective, ip, port) else {
+        return Destination::Allowed;
+    };
+    let held = match (approvable, port) {
+        (Some(approvable), Some(port)) => {
+            effective.deny.allows(ip, port)
+                && destination_verdict(approvable, ip, Some(port)).is_ok()
+        }
+        _ => false,
+    };
+    if held {
+        Destination::Held
+    } else {
+        Destination::Rejected(errno)
+    }
+}
+
+/// Resolve the effective layers and approvable rules for `pid`, then
+/// [`classify`] the destination. Approvable rules apply only when network
+/// events reach the callback, since nobody else can answer a held operation.
+pub(crate) async fn classify_destination(
+    ctx: &Arc<SupervisorCtx>,
+    ns: &crate::seccomp::state::NetworkState,
+    pid: u32,
+    protocol: Protocol,
+    ip: IpAddr,
+    port: Option<u16>,
+) -> Destination {
+    let (live_policy, network_events) = {
+        let pfs = ctx.policy_fn.lock().await;
+        (
+            pfs.live_policy.clone(),
+            pfs.events
+                .contains(crate::policy_fn::SyscallCategory::Network),
+        )
+    };
+    let effective = ns.effective_network_policy(pid, protocol, live_policy.as_ref());
+    let approvable = live_policy
+        .as_ref()
+        .filter(|_| network_events)
+        .map(|live| ns.approvable_network_policy(pid, protocol, live));
+    classify(&effective, approvable.as_ref(), ip, port)
+}
+
+/// [`classify_destination`] for handlers that do not otherwise need the
+/// network state.
 pub(crate) async fn check_ip_destination(
     ctx: &Arc<SupervisorCtx>,
     pid: u32,
     protocol: Protocol,
     ip: IpAddr,
     port: Option<u16>,
-) -> Result<(), i32> {
+) -> Destination {
     let ns = ctx.network.lock().await;
-    let live_policy = {
-        let pfs = ctx.policy_fn.lock().await;
-        pfs.live_policy.clone()
-    };
-    let effective = ns.effective_network_policy(pid, protocol, live_policy.as_ref());
-    drop(ns);
-    layered_destination_verdict(&effective, ip, port)
+    classify_destination(ctx, &ns, pid, protocol, ip, port).await
 }
 
 /// True if `real` (an already-canonical path) is at or under any of `prefixes`,
