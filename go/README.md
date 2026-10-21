@@ -234,14 +234,18 @@ func DenyWith(errnoValue int) PolicyDecision
 
 func (e SyscallEvent) ArgvContains(sub string) bool
 
-func (ctx *PolicyContext) RestrictNetwork(ips []string) error
-func (ctx *PolicyContext) GrantNetwork(ips []string) error
+func (ctx *PolicyContext) Restrict(p Permissions) error
 func (ctx *PolicyContext) RestrictMaxMemory(bytes uint64)
 func (ctx *PolicyContext) RestrictMaxProcesses(n uint32)
-func (ctx *PolicyContext) RestrictPIDNetwork(pid uint32, ips []string) error
+func (ctx *PolicyContext) RestrictPID(pid uint32, p Permissions) error
 func (ctx *PolicyContext) DenyPath(path string) error
 func (ctx *PolicyContext) AllowPath(path string) error
+
+func (a *Approval) AllowWith(p Permissions) error
 ```
+
+`PolicyFn.Approvable` bounds what `AllowWith` may grant; see
+[approve network on demand](../docs/policy-fn.md#approve-network-on-demand).
 
 `PolicyFn.Callback` receives dynamic syscall events from sandlock's policy-fn worker
 thread. Path strings are deliberately absent; use Landlock fields for static

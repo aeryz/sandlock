@@ -150,7 +150,7 @@ class TestPolicyFnEvents:
 # ---------------------------------------------------------------------------
 
 class TestPolicyFnRestrict:
-    def test_restrict_network_on_execve(self):
+    def test_restrict_on_execve(self):
         """restrict narrows outbound to the listed rules after execve.
 
         Two live loopback listeners are both allowlisted up front, so either
@@ -379,10 +379,10 @@ class TestPolicyFnVerdict:
 
 
 class TestPolicyFnPerPid:
-    def test_restrict_pid_network(self):
+    def test_restrict_pid(self):
         """restrict_pid narrows a specific pid's outbound to the listed rules.
 
-        Mirrors test_restrict_network_on_execve: restricting the exec'd pid to
+        Mirrors test_restrict_on_execve: restricting the exec'd pid to
         127.0.0.1 must permit the first listener and refuse the second.
         """
         def on_event(event, ctx):

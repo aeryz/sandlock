@@ -1,7 +1,8 @@
 //! Dynamic policy — live policy modification via syscall event callbacks.
 //!
 //! Allows a user-provided callback to inspect syscall events and adjust
-//! sandbox permissions at runtime (grant, restrict, per-PID overrides).
+//! sandbox permissions at runtime: narrow them through the context, or grant
+//! network rules within `PolicyFn::approvable` when answering an approval.
 //!
 //! ```
 //! use sandlock_core::{Sandbox, PolicyFn, policy_fn::Verdict};

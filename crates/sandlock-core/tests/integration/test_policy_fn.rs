@@ -192,7 +192,7 @@ async fn test_policy_fn_deny_connect_does_not_leave_socket_connected() {
 /// restricting to 127.0.0.1 must permit the first and refuse the second
 /// (ECONNREFUSED, errno 111).
 #[tokio::test]
-async fn test_policy_fn_restrict_network_takes_effect() {
+async fn test_policy_fn_restrict_takes_effect() {
     let out = temp_file("restrict-net-effect");
     let (_l1, p1) = loopback_listener("127.0.0.1");
     let (_l2, p2) = loopback_listener("127.0.0.2");

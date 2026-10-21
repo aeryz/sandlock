@@ -26,7 +26,7 @@ def on_event(event, ctx):
 
     # Lock down once the program has finished starting up
     if event.syscall == "execve":
-        ctx.restrict_network([])           # block all network
+        ctx.restrict(net_allow=[])         # block all network
         ctx.deny_path("/etc/shadow")       # dynamic fs deny
 
     # Audit every filesystem access (allow but flag)
@@ -72,11 +72,15 @@ positive int = deny with errno, `"audit"`/`-2` = allow + flag.
 >   never silently relaxed.
 
 **Context methods:**
-- `ctx.restrict_network(ips)` / `ctx.grant_network(ips)`: network control
+- `ctx.restrict(net_allow=specs)`: narrow the live network rules for good
 - `ctx.restrict_max_memory(bytes)` / `ctx.restrict_max_processes(n)`: resource limits
 - `ctx.deny_path(path)` / `ctx.allow_path(path)`: dynamic filesystem restriction
   (`deny_path` fails unless filesystem events are subscribed; see below)
-- `ctx.restrict_pid_network(pid, ips)`: per-PID network override
+- `ctx.restrict_pid(pid, net_allow=specs)`: narrow one process below the live rules
+
+Runtime specs use `net_allow` syntax with IPs and CIDRs only; a hostname
+raises `ValueError`. Widening the network is an answer to a held operation,
+so it lives on the approval (see [Approve network on demand](#approve-network-on-demand)).
 
 **Held syscalls** (the calling task is blocked awaiting a verdict; the
 rest of the sandbox keeps running): `execve`, `connect`, `sendto`,
@@ -86,7 +90,7 @@ rest of the sandbox keeps running): `execve`, `connect`, `sendto`,
 
 ```rust
 use sandlock_core::Sandbox;
-use sandlock_core::policy_fn::{PolicyFn, Verdict};
+use sandlock_core::policy_fn::{Permissions, PolicyFn, Verdict};
 
 let mut dynamic = Sandbox::builder()
     .fs_read("/usr").fs_read("/lib")
@@ -95,7 +99,7 @@ let mut dynamic = Sandbox::builder()
             return Verdict::Deny;
         }
         if event.syscall == "execve" {
-            ctx.restrict_network(&[]);
+            ctx.restrict(&Permissions::new().net_allow_none()).expect("literal rules");
             ctx.deny_path("/etc/shadow").expect("filesystem events are subscribed");
         }
         Verdict::Allow
@@ -159,7 +163,7 @@ subscribing to `process` adds no traps for them; it delivers their events and
 tracks each new child with ptrace.
 
 Unsubscribed syscalls remain governed by the static policy. Network supervision
-stays on for any callback, so `ctx.restrict_network()` works from every
+stays on for any callback, so `ctx.restrict()` works from every
 category. `ctx.deny_path()` needs filesystem events because only they keep path
 syscalls trapped; without them it fails (Python raises `RuntimeError`, Go
 returns `ErrFilesystemEventsRequired`, C returns `-1`) rather than silently not
@@ -206,6 +210,64 @@ sandbox = Sandbox(policy_fn=PolicyFn(on_event, deferred=True, verdict_timeout=No
 `resolve` takes the same verdict encoding as a synchronous callback's return
 value.
 
+## Approve network on demand
+
+A sandbox can start with no network and open it when a person says yes.
+`net_allow` is what the sandbox may reach at launch; `PolicyFn.approvable`
+is the most an approval may ever add on top. A connect or send to a
+destination inside `approvable` but not yet allowed is held for the callback,
+and `approval.allow(net_allow=...)` grants those rules for good and then lets
+the held operation through.
+
+```python
+import threading
+from sandlock import Sandbox, PolicyFn, Permissions
+
+def on_event(event, ctx, approval):
+    if approval is None:
+        return
+    def decide():
+        if ask_human(f"{event.host}:{event.port}?"):
+            approval.allow(net_allow=["*:*"])   # grant, then let this connect through
+        else:
+            approval.deny()
+    threading.Thread(target=decide).start()
+
+sandbox = Sandbox(
+    net_deny=["169.254.169.254"],
+    policy_fn=PolicyFn(
+        on_event,
+        deferred=True,
+        events={"network"},
+        approvable=Permissions(net_allow=["*:*"]),
+    ),
+)
+```
+
+Each destination falls in one class:
+
+| Class | Rule | Outcome |
+|---|---|---|
+| denied | matches `net_deny` | refused; no grant can open it |
+| allowed | inside the live rules (`net_allow` plus grants) | runs, still reported to a network callback |
+| held | inside `approvable`, outside the live rules | waits for the approval; a plain `allow()` lets this one through without granting |
+| rejected | outside `approvable` | refused with `ECONNREFUSED`; the callback still sees it but cannot grant it |
+
+A grant outside `approvable`, or after `ctx.restrict()` narrowed it, fails
+without answering the approval (Python raises `PermissionError`, Go returns
+`ErrNotApprovable`, C returns `-EPERM`), so the caller can still deny. A held
+operation that times out or is closed is refused with `ECONNREFUSED`. As in
+`net_allow`, `*:*` covers TCP and UDP but not ICMP; add `icmp://*` to approve
+pings. A `policy_fn` with neither `net_allow` nor `approvable` reaches no
+network.
+
+| API | Approvable rules | Grant and allow |
+|---|---|---|
+| Python | `PolicyFn(cb, approvable=Permissions(net_allow=[...]))` | `approval.allow(net_allow=[...])` |
+| Rust | `PolicyFn::deferred(cb).approvable(Permissions::new().net_allow(..))` | `approval.allow_with(&permissions)` |
+| Go | `PolicyFn{Approvable: &sandlock.Permissions{NetAllow: ...}}` | `approval.AllowWith(sandlock.Permissions{...})` |
+| C | `sandlock_sandbox_builder_approvable_net_allow` | `sandlock_approval_allow_net_allow` |
+
 ## Interaction with static rules
 
 `policy_fn` only sees the syscalls the supervisor traps. Landlock rules
@@ -214,7 +276,6 @@ by the kernel first and never reach the callback, so a Landlock denial
 cannot be overridden from `policy_fn`. Path-based decisions belong in
 those static rules; use `ctx.deny_path()` for runtime additions.
 
-Dynamic network restrictions are IP-only and resolve with legacy priority
-(per-PID override > live policy > static allowlist); the static `net_deny`
-layer is applied after the allow verdict and always wins, so a dynamic
-override can never erase it.
+Runtime network rules are IP-only. A per-PID override narrows the live
+rules for that process; the static `net_deny` layer is applied after the
+allow verdict and always wins, so no grant or override can erase it.
