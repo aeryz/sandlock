@@ -1130,6 +1130,17 @@ impl SandboxBuilder {
             for s in pf.approvable.net_allow_specs().unwrap_or_default() {
                 rules.extend(NetRule::parse_allow(s)?);
             }
+            // Only a network callback can answer a held operation; without one
+            // the approvable rules would loosen Landlock and never be granted.
+            if !rules.is_empty()
+                && !pf
+                    .events
+                    .contains(crate::policy_fn::SyscallCategory::Network)
+            {
+                return Err(SandboxError::Invalid(
+                    "approvable network rules need a policy_fn subscribed to network events".into(),
+                ));
+            }
             pf.approvable_net_allow = rules;
         }
 

@@ -259,7 +259,8 @@ without answering the approval (Python raises `PermissionError`, Go returns
 operation that times out or is closed is refused with `ECONNREFUSED`. As in
 `net_allow`, `*:*` covers TCP and UDP but not ICMP; add `icmp://*` to approve
 pings. A `policy_fn` with neither `net_allow` nor `approvable` reaches no
-network.
+network. Approvable rules need a callback subscribed to network events, since
+only it can answer a held operation; building fails otherwise.
 
 | API | Approvable rules | Grant and allow |
 |---|---|---|

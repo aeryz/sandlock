@@ -1528,9 +1528,15 @@ async fn approvable_does_not_open_network_by_itself() {
     listener.set_nonblocking(true).unwrap();
     let mut policy = base_policy()
         .policy_fn(
-            PolicyFn::new(|_e, _c| Verdict::Allow)
-                .events(&[SyscallCategory::Process])
-                .approvable(Permissions::new().net_allow("*:*")),
+            PolicyFn::new(|e, _c| {
+                if is_network_send(&e.syscall) {
+                    Verdict::Deny
+                } else {
+                    Verdict::Allow
+                }
+            })
+            .events(&[SyscallCategory::Network])
+            .approvable(Permissions::new().net_allow("*:*")),
         )
         .build()
         .unwrap();
@@ -1554,7 +1560,7 @@ async fn approvable_allows_udp_socket_creation() {
     let mut policy = base_policy()
         .policy_fn(
             PolicyFn::new(|_e, _c| Verdict::Allow)
-                .events(&[SyscallCategory::Process])
+                .events(&[SyscallCategory::Network])
                 .approvable(Permissions::new().net_allow("*:*")),
         )
         .build()

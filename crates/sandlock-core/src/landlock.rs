@@ -1006,6 +1006,22 @@ mod mask_contract_tests {
     }
 
     #[test]
+    fn approvable_requires_network_events() {
+        use crate::policy_fn::{Permissions, PolicyFn, SyscallCategory, Verdict};
+        let build = |events: &[SyscallCategory]| {
+            Sandbox::builder()
+                .policy_fn(
+                    PolicyFn::new(|_e, _c| Verdict::Allow)
+                        .events(events)
+                        .approvable(Permissions::new().net_allow("*:*")),
+                )
+                .build()
+        };
+        assert!(build(&[SyscallCategory::Process]).is_err());
+        assert!(build(&[SyscallCategory::Network]).is_ok());
+    }
+
+    #[test]
     fn net_mask_combined_wildcard_drops_connect_tcp() {
         let pol = ProtectionPolicy::strict_all();
         let sb = Sandbox::builder()
