@@ -261,6 +261,29 @@ async fn test_wait_keeps_jobs_and_shutdown_ends_them() {
 }
 
 #[tokio::test]
+async fn test_join_lets_jobs_finish_and_returns_mains_status() {
+    let mut sb = policy();
+    sb.spawn(&[
+        "sh",
+        "-c",
+        "(sleep 0.5; echo job-done) & echo main-done; exit 3",
+    ])
+    .await
+    .unwrap();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), sb.join())
+        .await
+        .expect("join() hung")
+        .unwrap();
+    assert_eq!(status, sandlock_core::ExitStatus::Code(3));
+    let result = sb.shutdown().await.unwrap();
+    assert_eq!(result.exit_status, sandlock_core::ExitStatus::Code(3));
+    assert_eq!(
+        result.stdout.as_deref(),
+        Some(b"main-done\njob-done\n".as_slice())
+    );
+}
+
+#[tokio::test]
 async fn test_shutdown_returns_output_while_a_job_holds_stdout() {
     let mut sb = policy();
     sb.spawn(&["sh", "-c", "sleep 60 & echo main-output"])

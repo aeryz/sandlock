@@ -1160,6 +1160,16 @@ impl Sandbox {
         Ok(exit_status)
     }
 
+    /// Wait for main, then for every job it left behind, so a following
+    /// [`Self::shutdown`] has nothing to kill. Returns main's status.
+    pub async fn join(&mut self) -> Result<crate::result::ExitStatus, crate::error::SandlockError> {
+        let exit_status = self.wait().await?;
+        if let Some(reaper) = self.rt().reaper.as_ref() {
+            reaper.exit().await;
+        }
+        Ok(exit_status)
+    }
+
     /// Kill every remaining job, wait until the session has no process left,
     /// then settle COW and collect the captured output. Safe to call again.
     pub async fn shutdown(

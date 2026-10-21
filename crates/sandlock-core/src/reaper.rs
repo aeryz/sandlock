@@ -29,10 +29,15 @@ impl Reaper {
         crate::pgroup::has_exited(self.pidfd.as_raw_fd())
     }
 
-    pub async fn join(&self) {
+    /// The reaper exits once the session has no process left.
+    pub async fn exit(&self) {
         if let Ok(fd) = tokio::io::unix::AsyncFd::new(self.pidfd.as_raw_fd()) {
             let _ = fd.readable().await;
         }
+    }
+
+    pub async fn join(&self) {
+        self.exit().await;
         reap(self.pid);
     }
 
