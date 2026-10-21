@@ -114,33 +114,31 @@ func (e SyscallEvent) ArgvContains(sub string) bool {
 }
 
 // PolicyDecision is the result returned by a PolicyFunc.
-type PolicyDecision int32
-
-const (
-	// DecisionAllow allows the syscall.
-	DecisionAllow PolicyDecision = 0
-	// DecisionDeny denies the syscall with EPERM.
-	DecisionDeny PolicyDecision = -1
-	// DecisionAudit allows the syscall and flags it for audit.
-	DecisionAudit PolicyDecision = -2
-)
+type PolicyDecision struct {
+	code  int32
+	grant *Permissions
+}
 
 // Allow returns a decision that allows the syscall.
-func Allow() PolicyDecision { return DecisionAllow }
+func Allow() PolicyDecision { return PolicyDecision{} }
 
 // Deny returns a decision that denies the syscall with EPERM.
-func Deny() PolicyDecision { return DecisionDeny }
+func Deny() PolicyDecision { return PolicyDecision{code: -1} }
 
 // Audit returns a decision that allows the syscall and flags it for audit.
-func Audit() PolicyDecision { return DecisionAudit }
+func Audit() PolicyDecision { return PolicyDecision{code: -2} }
 
 // DenyWith returns a decision that denies the syscall with errnoValue.
 func DenyWith(errnoValue int) PolicyDecision {
 	if errnoValue <= 0 {
-		return DecisionDeny
+		return Deny()
 	}
-	return PolicyDecision(errnoValue)
+	return PolicyDecision{code: int32(errnoValue)}
 }
+
+// Grant returns a decision that widens the live rules to p for good, within
+// PolicyFn.Approvable, then allows. A grant outside it denies the syscall.
+func Grant(p Permissions) PolicyDecision { return PolicyDecision{grant: &p} }
 
 // PolicyContext lets a PolicyFunc adjust selected live policy state.
 //

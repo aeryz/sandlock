@@ -12,7 +12,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -202,20 +201,14 @@ func TestSyscallEventArgvContains(t *testing.T) {
 }
 
 func TestPolicyDecisionValues(t *testing.T) {
-	if sandlock.Allow() != sandlock.DecisionAllow {
-		t.Fatal("Allow did not return DecisionAllow")
+	if sandlock.Allow() == sandlock.Deny() || sandlock.Audit() == sandlock.Allow() {
+		t.Fatal("Allow, Deny and Audit must differ")
 	}
-	if sandlock.Deny() != sandlock.DecisionDeny {
-		t.Fatal("Deny did not return DecisionDeny")
+	if got := sandlock.DenyWith(13); got == sandlock.Allow() || got == sandlock.Deny() {
+		t.Fatal("DenyWith must carry a positive errno")
 	}
-	if sandlock.Audit() != sandlock.DecisionAudit {
-		t.Fatal("Audit did not return DecisionAudit")
-	}
-	if got := sandlock.DenyWith(13); got == sandlock.DecisionAllow {
-		t.Fatal("DenyWith returned allow for positive errno")
-	}
-	if got := sandlock.DenyWith(0); got != sandlock.DecisionDeny {
-		t.Fatalf("DenyWith(0) = %d, want deny", got)
+	if sandlock.DenyWith(0) != sandlock.Deny() {
+		t.Fatal("DenyWith(0) must deny with EPERM")
 	}
 }
 
@@ -1122,10 +1115,7 @@ func runApprovedConnect(t *testing.T, grant []string) (bool, error) {
 					_ = approval.Resolve(sandlock.Allow())
 					return
 				}
-				err := approval.AllowWith(sandlock.Permissions{NetAllow: grant})
-				if err != nil {
-					_ = approval.Resolve(sandlock.DenyWith(int(syscall.ECONNREFUSED)))
-				}
+				err := approval.Resolve(sandlock.Grant(sandlock.Permissions{NetAllow: grant}))
 				mu.Lock()
 				grantErr = err
 				mu.Unlock()
@@ -1142,23 +1132,59 @@ func runApprovedConnect(t *testing.T, grant []string) (bool, error) {
 	return res.Success, grantErr
 }
 
-func TestApprovalAllowWithGrantsNetwork(t *testing.T) {
+func TestApprovalGrantOpensNetwork(t *testing.T) {
 	ok, err := runApprovedConnect(t, nil)
 	if err != nil {
-		t.Fatalf("AllowWith: %v", err)
+		t.Fatalf("Grant: %v", err)
 	}
 	if !ok {
 		t.Fatal("granted connect must succeed")
 	}
 }
 
-func TestApprovalAllowWithOutsideApprovable(t *testing.T) {
+func TestApprovalGrantOutsideApprovableDenies(t *testing.T) {
 	ok, err := runApprovedConnect(t, []string{"10.0.0.1:443"})
 	if !errors.Is(err, sandlock.ErrNotApprovable) {
-		t.Fatalf("AllowWith = %v, want ErrNotApprovable", err)
+		t.Fatalf("Grant = %v, want ErrNotApprovable", err)
 	}
 	if ok {
 		t.Fatal("connect must stay refused")
+	}
+}
+
+func TestSyncCallbackReturnsGrant(t *testing.T) {
+	requireLandlock(t)
+	if _, err := os.Stat("/usr/bin/python3"); err != nil {
+		t.Skip("python3 not available")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	grant := sandlock.Permissions{NetAllow: []string{"127.0.0.1:*"}}
+	sb := &sandlock.Sandbox{
+		FSReadable: rootfs,
+		PolicyFn: &sandlock.PolicyFn{
+			Events:     []sandlock.SyscallCategory{sandlock.CategoryNetwork},
+			Approvable: &grant,
+			Callback: func(event sandlock.SyscallEvent, ctx *sandlock.PolicyContext) sandlock.PolicyDecision {
+				if event.Syscall == "connect" {
+					return sandlock.Grant(grant)
+				}
+				return sandlock.Allow()
+			},
+		},
+	}
+	script := fmt.Sprintf("import socket; socket.create_connection(('127.0.0.1', %d)).close()", port)
+	res, err := sb.Run(context.Background(), "python3", "-c", script)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("granted connect failed: stderr=%q", res.Stderr)
 	}
 }
 

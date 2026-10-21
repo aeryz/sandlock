@@ -14,7 +14,6 @@ package sandlock
 #include <stdlib.h>
 #include "sandlock.h"
 
-extern int32_t goPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, void *user_data);
 extern void goDeferredPolicyCallback(sandlock_event_t *event, sandlock_ctx_t *ctx, sandlock_approval_t *approval, void *user_data);
 extern void goPolicyDrop(void *user_data);
 */
@@ -98,25 +97,6 @@ func policyEventFromC(ev *C.sandlock_event_t) SyscallEvent {
 	return out
 }
 
-//export goPolicyCallback
-func goPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, userData unsafe.Pointer) (ret C.int32_t) {
-	ret = C.int32_t(DecisionDeny)
-	defer func() {
-		if recover() != nil {
-			ret = C.int32_t(DecisionDeny)
-		}
-	}()
-
-	fn, ok := policyCallbacks.Load(policyCallbackID(userData))
-	if !ok {
-		return C.int32_t(DecisionDeny)
-	}
-	decision := fn.(PolicyFunc)(policyEventFromC(event), &PolicyContext{
-		ptr: unsafe.Pointer(ctx),
-	})
-	return C.int32_t(decision)
-}
-
 //export goDeferredPolicyCallback
 func goDeferredPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, approval *C.sandlock_approval_t, userData unsafe.Pointer) {
 	var a *Approval
@@ -138,29 +118,23 @@ func goDeferredPolicyCallback(event *C.sandlock_event_t, ctx *C.sandlock_ctx_t, 
 	fn.(DeferredPolicyFunc)(policyEventFromC(event), &PolicyContext{ptr: unsafe.Pointer(ctx)}, a)
 }
 
-// Resolve answers the held syscall with decision.
+// Resolve answers the held syscall with decision. A refused Grant denies
+// the syscall and returns ErrNotApprovable, ErrInvalidRule or
+// ErrInvalidString.
 func (a *Approval) Resolve(decision PolicyDecision) error {
-	ptr := a.take()
+	ptr := (*C.sandlock_approval_t)(a.take())
 	if ptr == nil {
 		return ErrApprovalAnswered
 	}
-	C.sandlock_approval_resolve((*C.sandlock_approval_t)(ptr), C.int32_t(decision))
-	return nil
-}
-
-// AllowWith grants p for good, then allows the held operation. On error
-// nothing changes and the approval stays unanswered.
-func (a *Approval) AllowWith(p Permissions) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.ptr == nil {
-		return ErrApprovalAnswered
+	if decision.grant == nil {
+		C.sandlock_approval_resolve(ptr, C.int32_t(decision.code))
+		return nil
 	}
-	err := withNetAllow(p.NetAllow, func(specs **C.char, n C.uint32_t) C.int {
-		return C.sandlock_approval_allow_net_allow((*C.sandlock_approval_t)(a.ptr), specs, n)
+	err := withNetAllow(decision.grant.NetAllow, func(specs **C.char, n C.uint32_t) C.int {
+		return C.sandlock_approval_grant_net_allow(ptr, specs, n)
 	})
-	if err == nil {
-		a.ptr = nil
+	if err == ErrInvalidString {
+		C.sandlock_approval_resolve(ptr, C.int32_t(Deny().code))
 	}
 	return err
 }
@@ -499,25 +473,25 @@ func (s *Sandbox) buildPolicy() (*C.sandlock_sandbox_t, error) {
 				events |= 1 << category
 			}
 		}
-		if s.PolicyFn.Deferred != nil {
-			b = C.sandlock_sandbox_builder_policy_fn_deferred(
-				b,
-				(C.sandlock_policy_deferred_fn_t)(C.goDeferredPolicyCallback),
-				C.int64_t(timeoutMs),
-				events,
-				registerPolicyCallback(s.PolicyFn.Deferred),
-				(*[0]byte)(C.goPolicyDrop),
-			)
-		} else {
-			b = C.sandlock_sandbox_builder_policy_fn(
-				b,
-				(C.sandlock_policy_fn_t)(C.goPolicyCallback),
-				C.int64_t(timeoutMs),
-				events,
-				registerPolicyCallback(s.PolicyFn.Callback),
-				(*[0]byte)(C.goPolicyDrop),
-			)
+		deferred := s.PolicyFn.Deferred
+		if deferred == nil {
+			// Answered through the approval so a returned Grant can apply.
+			callback := s.PolicyFn.Callback
+			deferred = func(event SyscallEvent, ctx *PolicyContext, approval *Approval) {
+				decision := callback(event, ctx)
+				if approval != nil {
+					_ = approval.Resolve(decision)
+				}
+			}
 		}
+		b = C.sandlock_sandbox_builder_policy_fn_deferred(
+			b,
+			(C.sandlock_policy_deferred_fn_t)(C.goDeferredPolicyCallback),
+			C.int64_t(timeoutMs),
+			events,
+			registerPolicyCallback(deferred),
+			(*[0]byte)(C.goPolicyDrop),
+		)
 		if s.PolicyFn.Approvable != nil {
 			cspecs, _ := cStringArray(s.PolicyFn.Approvable.NetAllow)
 			ptr, n := cStringArrayPtr(cspecs)
