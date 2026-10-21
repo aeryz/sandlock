@@ -2961,7 +2961,8 @@ async fn finish_notification(
         // Only an answer opens a held operation; refuse it like any policy miss.
         Some(Verdict::Allow | Verdict::Audit) if held => {}
         _ if held => action = NotifAction::Errno(libc::ECONNREFUSED),
-        Some(Verdict::Deny) => action = NotifAction::Errno(libc::EPERM),
+        // Approval::resolve turns a grant into Allow or Deny before it gets here.
+        Some(Verdict::Deny | Verdict::Grant(_)) => action = NotifAction::Errno(libc::EPERM),
         _ => {}
     }
 

@@ -1654,10 +1654,9 @@ async fn run_script(policy: &mut Sandbox, script: &str, out: &std::path::Path) -
 fn grant_first(specs: &'static str) -> impl Fn(usize, Approval) + Send + 'static {
     move |i, approval| {
         if i == 0 {
-            if let Err((approval, e)) = approval.allow_with(&Permissions::new().net_allow(specs)) {
-                approval.deny();
-                panic!("grant failed: {e}");
-            }
+            approval
+                .try_resolve(Verdict::Grant(Permissions::new().net_allow(specs)))
+                .expect("grant within approvable");
         } else {
             approval.allow();
         }
@@ -1731,22 +1730,18 @@ async fn connect_outside_approvable_stays_refused() {
 }
 
 #[tokio::test]
-async fn allow_with_outside_approvable_returns_approval() {
-    let out = temp_file("allow-with-outside");
+async fn grant_outside_approvable_denies() {
+    let out = temp_file("grant-outside");
     let (_l, port) = loopback_listener("127.0.0.1");
     let refused = Arc::new(Mutex::new(Vec::new()));
     let record = refused.clone();
     let (policy_fn, _) = approver(move |_, approval| {
-        match approval.allow_with(&Permissions::new().net_allow("10.0.0.0/8:*")) {
-            Ok(()) => record.lock().unwrap().push(false),
-            Err((approval, e)) => {
-                record
-                    .lock()
-                    .unwrap()
-                    .push(matches!(e, PolicyFnError::NotApprovable(_)));
-                approval.deny();
-            }
-        }
+        let result =
+            approval.try_resolve(Verdict::Grant(Permissions::new().net_allow("10.0.0.0/8:*")));
+        record
+            .lock()
+            .unwrap()
+            .push(matches!(result, Err(PolicyFnError::NotApprovable(_))));
     });
     let mut policy = base_policy()
         .policy_fn(policy_fn.approvable(Permissions::new().net_allow("127.0.0.1:*")))
@@ -1758,8 +1753,8 @@ async fn allow_with_outside_approvable_returns_approval() {
 }
 
 #[tokio::test]
-async fn allow_with_after_restrict_fails() {
-    let out = temp_file("allow-with-restricted");
+async fn grant_after_restrict_denies() {
+    let out = temp_file("grant-restricted");
     let (_l, port) = loopback_listener("127.0.0.1");
     let (tx, rx) = std::sync::mpsc::channel::<Approval>();
     let tx = Mutex::new(tx);
@@ -1767,15 +1762,12 @@ async fn allow_with_after_restrict_fails() {
     let record = refused.clone();
     std::thread::spawn(move || {
         for approval in rx.iter() {
-            if let Err((approval, e)) =
-                approval.allow_with(&Permissions::new().net_allow("127.0.0.1:*"))
-            {
-                record
-                    .lock()
-                    .unwrap()
-                    .push(matches!(e, PolicyFnError::NotApprovable(_)));
-                approval.deny();
-            }
+            let result =
+                approval.try_resolve(Verdict::Grant(Permissions::new().net_allow("127.0.0.1:*")));
+            record
+                .lock()
+                .unwrap()
+                .push(matches!(result, Err(PolicyFnError::NotApprovable(_))));
         }
     });
     let mut policy = base_policy()
@@ -1798,6 +1790,37 @@ async fn allow_with_after_restrict_fails() {
     let script = connect_each(&[("127.0.0.1", port)], &out);
     assert_eq!(run_script(&mut policy, &script, &out).await, "ERR111");
     assert_eq!(*refused.lock().unwrap(), vec![true]);
+}
+
+#[tokio::test]
+async fn sync_callback_grant_opens_network() {
+    let out = temp_file("sync-grant");
+    let (_l1, p1) = loopback_listener("127.0.0.1");
+    let (_l2, p2) = loopback_listener("127.0.0.1");
+    let empty_live = Arc::new(Mutex::new(Vec::new()));
+    let seen = empty_live.clone();
+    let mut policy = base_policy()
+        .policy_fn(
+            PolicyFn::new(move |event, ctx| {
+                if !is_network_send(&event.syscall) {
+                    return Verdict::Allow;
+                }
+                let empty = ctx.current().net_allow.is_empty();
+                seen.lock().unwrap().push(empty);
+                if empty {
+                    Verdict::Grant(Permissions::new().net_allow("127.0.0.1:*"))
+                } else {
+                    Verdict::Allow
+                }
+            })
+            .events(&[SyscallCategory::Network])
+            .approvable(Permissions::new().net_allow("127.0.0.1:*")),
+        )
+        .build()
+        .unwrap();
+    let script = connect_each(&[("127.0.0.1", p1), ("127.0.0.1", p2)], &out);
+    assert_eq!(run_script(&mut policy, &script, &out).await, "OK OK");
+    assert_eq!(*empty_live.lock().unwrap(), vec![true, false]);
 }
 
 #[tokio::test]

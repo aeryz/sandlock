@@ -3,7 +3,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sandlock_ffi::{
-    sandlock_approval_allow_net_allow, sandlock_approval_free, sandlock_approval_is_cancelled,
+    sandlock_approval_free, sandlock_approval_grant_net_allow, sandlock_approval_is_cancelled,
     sandlock_approval_resolve, sandlock_approval_t, sandlock_ctx_restrict_net_allow,
     sandlock_ctx_t, sandlock_event_t, sandlock_result_free, sandlock_result_success, sandlock_run,
     sandlock_sandbox_build, sandlock_sandbox_builder_approvable_net_allow,
@@ -165,9 +165,9 @@ fn run_true(b: *mut sandlock_core::SandboxBuilder) -> bool {
     success
 }
 
-/// Each held approval is answered with a grant of `spec`; on failure the
-/// return code is recorded and the still-live approval is allowed.
-fn grant_on_every_approval(spec: &'static str) -> Vec<i32> {
+/// Answer each held approval with a grant of `spec`; returns the codes and
+/// whether `/bin/true` ran.
+fn grant_on_every_approval(spec: &'static str) -> (Vec<i32>, bool) {
     let (tx, rx) = std::sync::mpsc::channel::<usize>();
     let approver = Box::into_raw(Box::new(Approver {
         tx: std::sync::Mutex::new(tx),
@@ -178,11 +178,7 @@ fn grant_on_every_approval(spec: &'static str) -> Vec<i32> {
         let mut codes = Vec::new();
         for approval in rx {
             let approval = approval as *mut sandlock_approval_t;
-            let rc = unsafe { sandlock_approval_allow_net_allow(approval, specs.as_ptr(), 1) };
-            codes.push(rc);
-            if rc != 0 {
-                unsafe { sandlock_approval_resolve(approval, 0) };
-            }
+            codes.push(unsafe { sandlock_approval_grant_net_allow(approval, specs.as_ptr(), 1) });
         }
         codes
     });
@@ -199,13 +195,14 @@ fn grant_on_every_approval(spec: &'static str) -> Vec<i32> {
     let approvable = CString::new("127.0.0.1:*").unwrap();
     let approvable = [approvable.as_ptr()];
     b = unsafe { sandlock_sandbox_builder_approvable_net_allow(b, approvable.as_ptr(), 1) };
-    assert!(run_true(b));
-    resolver.join().unwrap()
+    let ran = run_true(b);
+    (resolver.join().unwrap(), ran)
 }
 
 #[test]
-fn approval_allow_net_allow_grants_within_approvable() {
-    let codes = grant_on_every_approval("127.0.0.1:*");
+fn approval_grant_within_approvable_allows() {
+    let (codes, ran) = grant_on_every_approval("127.0.0.1:*");
+    assert!(ran);
     assert!(
         !codes.is_empty() && codes.iter().all(|&rc| rc == 0),
         "{codes:?}"
@@ -213,8 +210,9 @@ fn approval_allow_net_allow_grants_within_approvable() {
 }
 
 #[test]
-fn approval_allow_net_allow_rejects_outside_approvable_and_keeps_approval() {
-    let codes = grant_on_every_approval("10.0.0.0/8:*");
+fn approval_grant_outside_approvable_denies() {
+    let (codes, ran) = grant_on_every_approval("10.0.0.0/8:*");
+    assert!(!ran);
     assert!(
         !codes.is_empty() && codes.iter().all(|&rc| rc == -libc::EPERM),
         "{codes:?}"
@@ -222,8 +220,9 @@ fn approval_allow_net_allow_rejects_outside_approvable_and_keeps_approval() {
 }
 
 #[test]
-fn approval_allow_net_allow_rejects_hostname() {
-    let codes = grant_on_every_approval("example.com:443");
+fn approval_grant_hostname_denies() {
+    let (codes, ran) = grant_on_every_approval("example.com:443");
+    assert!(!ran);
     assert!(
         !codes.is_empty() && codes.iter().all(|&rc| rc == -libc::EINVAL),
         "{codes:?}"

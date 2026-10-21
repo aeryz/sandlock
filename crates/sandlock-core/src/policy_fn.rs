@@ -182,7 +182,7 @@ pub use crate::network::NetRuleSet;
 
 /// Permissions in the `Sandbox` vocabulary, used to narrow live policy or to
 /// bound what approvals may open.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Permissions {
     net_allow: Option<Vec<String>>,
 }
@@ -391,6 +391,9 @@ pub enum Verdict {
     Deny,
     /// Deny the syscall with a specific errno.
     DenyWith(i32),
+    /// Widen the live rules to `Permissions` for good, within
+    /// [`PolicyFn::approvable`], then allow. A grant outside it denies.
+    Grant(Permissions),
 }
 
 impl Default for Verdict {
@@ -426,8 +429,26 @@ pub struct Approval {
 }
 
 impl Approval {
+    /// Answer the held syscall. A refused [`Verdict::Grant`] denies it and
+    /// is logged; use [`Approval::try_resolve`] to see why.
     pub fn resolve(self, verdict: Verdict) {
+        if let Err(e) = self.try_resolve(verdict) {
+            eprintln!("sandlock: policy_fn grant refused, operation denied: {e}");
+        }
+    }
+
+    /// Like [`Approval::resolve`], but reports a refused grant. The syscall
+    /// is answered either way.
+    pub fn try_resolve(self, verdict: Verdict) -> Result<(), PolicyFnError> {
+        let (verdict, result) = match verdict {
+            Verdict::Grant(p) => match self.grant(&p) {
+                Ok(()) => (Verdict::Allow, Ok(())),
+                Err(e) => (Verdict::Deny, Err(e)),
+            },
+            verdict => (verdict, Ok(())),
+        };
         let _ = self.gate.send(verdict);
+        result
     }
 
     pub fn allow(self) {
@@ -438,30 +459,19 @@ impl Approval {
         self.resolve(Verdict::Deny);
     }
 
-    /// Open `p` for good, then allow this operation. On failure nothing
-    /// changes and the approval comes back unanswered.
-    pub fn allow_with(self, p: &Permissions) -> Result<(), (Approval, PolicyFnError)> {
-        let rules = match p.net_rules() {
-            Ok(rules) => rules,
-            Err(e) => return Err((self, e)),
-        };
-        let Some(live) = self.live.clone() else {
-            return Err((self, PolicyFnError::NotApprovable("no live policy".into())));
-        };
-        {
-            let mut live = live.write().unwrap();
-            if !live.net_approvable.covers(&rules) {
-                drop(live);
-                return Err((
-                    self,
-                    PolicyFnError::NotApprovable(
-                        p.net_allow_specs().unwrap_or_default().join(", "),
-                    ),
-                ));
-            }
-            live.net_allow.union(&rules);
+    fn grant(&self, p: &Permissions) -> Result<(), PolicyFnError> {
+        let rules = p.net_rules()?;
+        let live = self
+            .live
+            .as_ref()
+            .ok_or_else(|| PolicyFnError::NotApprovable("no live policy".into()))?;
+        let mut live = live.write().unwrap();
+        if !live.net_approvable.covers(&rules) {
+            return Err(PolicyFnError::NotApprovable(
+                p.net_allow_specs().unwrap_or_default().join(", "),
+            ));
         }
-        self.allow();
+        live.net_allow.union(&rules);
         Ok(())
     }
 

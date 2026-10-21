@@ -1292,16 +1292,16 @@ sandlock_builder_t *sandlock_sandbox_builder_approvable_net_allow(sandlock_build
                                                                   uint32_t count);
 
 /**
- * Grant `specs` (`net_allow` syntax, no hostnames) within the approvable
- * rules, then allow and free the approval. Returns 0, `-EPERM` when a spec
- * is outside the approvable rules, or `-EINVAL`; on failure the approval
- * stays live and unanswered.
+ * Resolve and free an approval with a grant: widen the live rules to `specs`
+ * (`net_allow` syntax, no hostnames) within the approvable rules, then allow.
+ * Returns 0, or `-EPERM` when a spec is outside the approvable rules and
+ * `-EINVAL` for a malformed spec; on failure the syscall is denied.
  *
  * # Safety
- * `approval` must be a live approval. `specs` must point to `count` valid
- * C strings.
+ * `approval` must be null or an approval not yet resolved or freed. `specs`
+ * must point to `count` valid C strings.
  */
-int sandlock_approval_allow_net_allow(sandlock_approval_t *approval,
+int sandlock_approval_grant_net_allow(sandlock_approval_t *approval,
                                       const char *const *specs,
                                       uint32_t count);
 

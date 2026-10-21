@@ -2550,16 +2550,16 @@ pub unsafe extern "C" fn sandlock_sandbox_builder_approvable_net_allow(
     Box::into_raw(Box::new(builder))
 }
 
-/// Grant `specs` (`net_allow` syntax, no hostnames) within the approvable
-/// rules, then allow and free the approval. Returns 0, `-EPERM` when a spec
-/// is outside the approvable rules, or `-EINVAL`; on failure the approval
-/// stays live and unanswered.
+/// Resolve and free an approval with a grant: widen the live rules to `specs`
+/// (`net_allow` syntax, no hostnames) within the approvable rules, then allow.
+/// Returns 0, or `-EPERM` when a spec is outside the approvable rules and
+/// `-EINVAL` for a malformed spec; on failure the syscall is denied.
 ///
 /// # Safety
-/// `approval` must be a live approval. `specs` must point to `count` valid
-/// C strings.
+/// `approval` must be null or an approval not yet resolved or freed. `specs`
+/// must point to `count` valid C strings.
 #[no_mangle]
-pub unsafe extern "C" fn sandlock_approval_allow_net_allow(
+pub unsafe extern "C" fn sandlock_approval_grant_net_allow(
     approval: *mut sandlock_approval_t,
     specs: *const *const c_char,
     count: u32,
@@ -2567,23 +2567,19 @@ pub unsafe extern "C" fn sandlock_approval_allow_net_allow(
     if approval.is_null() {
         return -libc::EINVAL;
     }
-    let p = match net_allow_permissions(specs, count) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-    let slot = &mut (*approval).approval;
-    let Some(a) = slot.take() else {
+    let Some(a) = Box::from_raw(approval).approval else {
         return -libc::EINVAL;
     };
-    match a.allow_with(&p) {
-        Ok(()) => {
-            drop(Box::from_raw(approval));
-            0
+    let p = match net_allow_permissions(specs, count) {
+        Ok(p) => p,
+        Err(e) => {
+            a.deny();
+            return e;
         }
-        Err((a, e)) => {
-            *slot = Some(a);
-            policy_fn_errno(&e)
-        }
+    };
+    match a.try_resolve(sandlock_core::policy_fn::Verdict::Grant(p)) {
+        Ok(()) => 0,
+        Err(e) => policy_fn_errno(&e),
     }
 }
 
