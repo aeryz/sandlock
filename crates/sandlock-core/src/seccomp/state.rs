@@ -607,6 +607,31 @@ impl NetworkState {
     /// empty live set denies everything; a per-process override narrows them
     /// further. Deny is always the static per-protocol denylist, applied after
     /// the allow verdict, so a dynamic rule can never erase it.
+    fn pid_net_rules(&self, tid: u32) -> Option<crate::network::NetRuleSet> {
+        let overrides = self.pid_net_overrides.read().ok()?;
+        if overrides.is_empty() {
+            return None;
+        }
+        // Overrides are keyed by process; the notification names a thread.
+        let tgid = read_tgid_of_tid(tid as i32).map_or(tid, |t| t as u32);
+        overrides.get(&tgid).cloned()
+    }
+
+    /// What an approval could still open for `tid`: the approvable rules,
+    /// narrowed by its per-process override.
+    pub(crate) fn approvable_network_policy(
+        &self,
+        tid: u32,
+        protocol: crate::sandbox::Protocol,
+        live_policy: &std::sync::RwLock<crate::policy_fn::LivePolicy>,
+    ) -> crate::seccomp::notif::NetworkPolicy {
+        let live = live_policy.read().unwrap();
+        match self.pid_net_rules(tid) {
+            Some(pid) => live.net_approvable.intersect(&pid).policy(protocol),
+            None => live.net_approvable.policy(protocol),
+        }
+    }
+
     pub(crate) fn effective_network_policy(
         &self,
         tid: u32,
@@ -619,14 +644,7 @@ impl NetworkState {
             Protocol::Udp => self.udp_deny_policy.clone(),
             Protocol::Icmp => self.icmp_deny_policy.clone(),
         };
-        let pid_rules = self.pid_net_overrides.read().ok().and_then(|overrides| {
-            if overrides.is_empty() {
-                return None;
-            }
-            // Overrides are keyed by process; the notification names a thread.
-            let tgid = read_tgid_of_tid(tid as i32).map_or(tid, |t| t as u32);
-            overrides.get(&tgid).cloned()
-        });
+        let pid_rules = self.pid_net_rules(tid);
         let live = live_policy.and_then(|lp| lp.read().ok());
         let dynamic = match (live.as_ref(), pid_rules) {
             (Some(live), Some(pid)) => Some(live.net_allow.intersect(&pid).policy(protocol)),

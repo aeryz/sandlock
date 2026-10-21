@@ -421,6 +421,7 @@ pub type PolicyCallback =
 pub struct Approval {
     gate: tokio::sync::oneshot::Sender<Verdict>,
     cancellation: CancellationToken,
+    live: Option<Arc<RwLock<LivePolicy>>>,
 }
 
 impl Approval {
@@ -434,6 +435,33 @@ impl Approval {
 
     pub fn deny(self) {
         self.resolve(Verdict::Deny);
+    }
+
+    /// Open `p` for good, then allow this operation. On failure nothing
+    /// changes and the approval comes back unanswered.
+    pub fn allow_with(self, p: &Permissions) -> Result<(), (Approval, PolicyFnError)> {
+        let rules = match p.net_rules() {
+            Ok(rules) => rules,
+            Err(e) => return Err((self, e)),
+        };
+        let Some(live) = self.live.clone() else {
+            return Err((self, PolicyFnError::NotApprovable("no live policy".into())));
+        };
+        {
+            let mut live = live.write().unwrap();
+            if !live.net_approvable.covers(&rules) {
+                drop(live);
+                return Err((
+                    self,
+                    PolicyFnError::NotApprovable(
+                        p.net_allow_specs().unwrap_or_default().join(", "),
+                    ),
+                ));
+            }
+            live.net_allow.union(&rules);
+        }
+        self.allow();
+        Ok(())
     }
 
     /// Whether shutdown or the verdict timeout already decided the syscall,
@@ -618,6 +646,7 @@ pub(crate) fn spawn_policy_fn(
                 let approval = pe.gate.map(|gate| Approval {
                     gate,
                     cancellation: ctx.cancellation.clone(),
+                    live: Some(ctx.live.clone()),
                 });
                 callback(pe.event, &mut ctx, approval);
             }
@@ -848,6 +877,7 @@ mod tests {
         drop(Approval {
             gate: tx,
             cancellation: CancellationToken::new(),
+            live: None,
         });
         assert_eq!(
             wait_for_verdict(rx, None, &CancellationToken::new()).await,
@@ -862,6 +892,7 @@ mod tests {
         let approval = Approval {
             gate: tx,
             cancellation: cancellation.clone(),
+            live: None,
         };
         assert!(!approval.is_cancelled());
         cancellation.cancel();
@@ -871,6 +902,7 @@ mod tests {
         let approval = Approval {
             gate: tx,
             cancellation: CancellationToken::new(),
+            live: None,
         };
         drop(rx2);
         assert!(approval.is_cancelled());

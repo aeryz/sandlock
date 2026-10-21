@@ -111,6 +111,8 @@ pub struct PreparedOperation {
     pub(crate) port: Option<u16>,
     pub(crate) protocol: Option<String>,
     pub(crate) extra_destinations: Vec<(Option<std::net::IpAddr>, Option<u16>)>,
+    /// Outside the live rules but approvable: runs only on an allowing verdict.
+    pub(crate) held: bool,
     execute: Box<dyn FnOnce() -> NotifAction + Send + Sync>,
 }
 
@@ -192,8 +194,16 @@ impl NotifAction {
                 .to_string()
             }),
             extra_destinations: Vec::new(),
+            held: false,
             execute: Box::new(execute),
         })
+    }
+
+    pub(crate) fn held_if(mut self, held: bool) -> Self {
+        if let NotifAction::Prepared(operation) = &mut self {
+            operation.held |= held;
+        }
+        self
     }
 
     /// Construct a [`NotifAction::Defer`] from a `'static` future.  Ergonomic
@@ -2944,9 +2954,14 @@ async fn finish_notification(
     } = prepared;
     let nr = notif.data.nr as i64;
 
+    use crate::policy_fn::Verdict;
+    let held = matches!(&action, NotifAction::Prepared(operation) if operation.held);
     match verdict {
-        Some(crate::policy_fn::Verdict::Deny) => action = NotifAction::Errno(libc::EPERM),
-        Some(crate::policy_fn::Verdict::DenyWith(errno)) => action = NotifAction::Errno(errno),
+        Some(Verdict::DenyWith(errno)) => action = NotifAction::Errno(errno),
+        // Only an answer opens a held operation; refuse it like any policy miss.
+        Some(Verdict::Allow | Verdict::Audit) if held => {}
+        _ if held => action = NotifAction::Errno(libc::ECONNREFUSED),
+        Some(Verdict::Deny) => action = NotifAction::Errno(libc::EPERM),
         _ => {}
     }
 

@@ -17,7 +17,7 @@ use super::materialize::{
 };
 use super::query_socket_protocol;
 use super::unix::connect_named_unix_on_behalf;
-use super::verdict::{layered_destination_verdict, path_under_any};
+use super::verdict::{classify_destination, path_under_any, Destination};
 
 // ============================================================
 // connect_on_behalf — perform connect() on behalf of the child (TOCTOU-safe)
@@ -79,14 +79,11 @@ pub(super) async fn connect_on_behalf(
         // (redirect / remap / passthrough) as data while the policy state is
         // locked. Everything after the lock drops is execute-only.
         let ns = ctx.network.lock().await;
-        let live_policy = {
-            let pfs = ctx.policy_fn.lock().await;
-            pfs.live_policy.clone()
+        let held = match classify_destination(ctx, &ns, notif.pid, protocol, ip, dest_port).await {
+            Destination::Allowed => false,
+            Destination::Held => true,
+            Destination::Rejected(e) => return NotifAction::Errno(e),
         };
-        let effective = ns.effective_network_policy(notif.pid, protocol, live_policy.as_ref());
-        if let Err(e) = layered_destination_verdict(&effective, ip, dest_port) {
-            return NotifAction::Errno(e);
-        }
         let proxy = ns
             .http_acl_addr
             .filter(|_| dest_port.map_or(false, |p| ns.http_acl_ports.contains(&p)));
@@ -114,6 +111,7 @@ pub(super) async fn connect_on_behalf(
             }
             connect_dup(dup_fd.as_raw_fd(), &plan.addr)
         })
+        .held_if(held)
     } else {
         // Non-IP family. A NAMED (pathname) AF_UNIX connect is a gap Landlock
         // cannot close (it has no access right for unix-socket connect), so a

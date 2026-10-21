@@ -417,6 +417,7 @@ pub struct ResolvedNetAllowSet {
 /// sets — the on-behalf check routes ICMP through the IP-only path
 /// (PortAllow::Any). A `*` host on ICMP becomes `any_ip_all_ports`,
 /// which the handler reads as "no destination check."
+#[cfg(test)]
 pub async fn resolve_net_allow(rules: &[NetAllow]) -> io::Result<ResolvedNetAllowSet> {
     let (host_ips, concrete_host_entries) = resolve_hosts(rules).await?;
     Ok(resolve_with_hosts(rules, &host_ips, concrete_host_entries))
