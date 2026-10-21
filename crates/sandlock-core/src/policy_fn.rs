@@ -340,6 +340,10 @@ pub enum PolicyFnError {
     FieldRestricted(String),
     #[error("{0:?} events are not subscribed")]
     NotSubscribed(SyscallCategory),
+    #[error("invalid network rule: {0}")]
+    Invalid(String),
+    #[error("not approvable: {0}")]
+    NotApprovable(String),
 }
 
 // ============================================================
