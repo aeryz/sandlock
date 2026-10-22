@@ -109,12 +109,14 @@ fn resolve_at_path_with_virtual(
     path: &str,
     virtual_cwd: Option<&str>,
 ) -> String {
+    // A descriptor path is openat(N, tail) under a spelling the workdir prefix
+    // never matches, so resolve the pair it names like any other dirfd path.
+    let descriptor = crate::seccomp::notif::descriptor_path_tail(notif, path);
+    let (dirfd, path) = match &descriptor {
+        Some((fd, tail)) => (*fd as i64, tail.as_str()),
+        None => (dirfd, path),
+    };
     if Path::new(path).is_absolute() {
-        // A descriptor path names a file the branch may own, under a spelling
-        // the workdir prefix never matches, so resolve it to where it lands.
-        if let Some(real) = crate::seccomp::notif::resolve_descriptor_path(notif, path) {
-            return normalize_path(real).to_string_lossy().into_owned();
-        }
         return normalize_path(PathBuf::from(path))
             .to_string_lossy()
             .into_owned();

@@ -512,14 +512,20 @@ async fn test_seccomp_cow_change_through_a_descriptor_path_is_staged() {
         "except FileNotFoundError:\n",
         "    nested = 'ENOENT'\n",
         "os.unlink(f'/proc/self/fd/{{dfd}}/victim.txt')\n",
-        "res = [open('{wd}/created.txt').read(), str(os.path.exists('{wd}/victim.txt')), nested]\n",
+        // The directory exists only in the branch, so the file inside it has
+        // to be resolved there too.
+        "os.mkdir(f'/proc/self/fd/{{dfd}}/sub')\n",
+        "fd = os.open(f'/proc/self/fd/{{dfd}}/sub/inner.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)\n",
+        "os.write(fd, b'z'); os.close(fd)\n",
+        "res = [open('{wd}/created.txt').read(), str(os.path.exists('{wd}/victim.txt')), nested,\n",
+        "       open('{wd}/sub/inner.txt').read()]\n",
         "open('{out}', 'w').write(','.join(res))\n",
     ), wd = workdir.display(), out = out_file.display());
 
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     // Staged under the file's real name, so the sandbox reads it back there.
-    assert_eq!(fs::read_to_string(&out_file).unwrap_or_default(), "x,False,ENOENT");
+    assert_eq!(fs::read_to_string(&out_file).unwrap_or_default(), "x,False,ENOENT,z");
     assert!(!workdir.join("created.txt").exists(), "the create escaped the branch");
     assert_eq!(
         fs::read_to_string(workdir.join("victim.txt")).unwrap_or_default(),
