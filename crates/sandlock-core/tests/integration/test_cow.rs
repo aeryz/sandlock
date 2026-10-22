@@ -486,13 +486,20 @@ async fn test_seccomp_cow_change_through_a_descriptor_path_is_staged() {
     let workdir = temp_dir("seccomp-cow-descriptor-path");
     fs::write(workdir.join("victim.txt"), b"precious").unwrap();
     let out_file = std::env::temp_dir().join(format!(
-        "sandlock-test-cow-descriptor-{}", std::process::id()
+        "sandlock-test-cow-descriptor-{}",
+        std::process::id()
     ));
 
     let mut policy = Sandbox::builder()
-        .fs_read("/usr").fs_read("/lib").fs_read_if_exists("/lib64").fs_read("/bin").fs_read("/etc")
-        .fs_read("/proc").fs_read("/dev")
-        .fs_write(&workdir).fs_write("/tmp")
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
         .workdir(&workdir)
         .cwd(&workdir)
         .on_exit(BranchAction::Abort)
@@ -523,10 +530,21 @@ async fn test_seccomp_cow_change_through_a_descriptor_path_is_staged() {
     ), wd = workdir.display(), out = out_file.display());
 
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
-    assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
     // Staged under the file's real name, so the sandbox reads it back there.
-    assert_eq!(fs::read_to_string(&out_file).unwrap_or_default(), "x,False,ENOENT,z");
-    assert!(!workdir.join("created.txt").exists(), "the create escaped the branch");
+    assert_eq!(
+        fs::read_to_string(&out_file).unwrap_or_default(),
+        "x,False,ENOENT,z"
+    );
+    assert!(
+        !workdir.join("created.txt").exists(),
+        "the create escaped the branch"
+    );
     assert_eq!(
         fs::read_to_string(workdir.join("victim.txt")).unwrap_or_default(),
         "precious",

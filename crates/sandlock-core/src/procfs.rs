@@ -722,7 +722,10 @@ fn dev_fd_aliases() -> &'static [(&'static str, &'static str)] {
 /// under any spelling of the caller's directory, or /dev/stdin and its kin.
 pub(crate) fn own_fd_request(path: &str, tid: i32, tgid: i32) -> Option<i32> {
     let fd = own_fd_rest(path, tid, tgid)?;
-    fd.bytes().all(|b| b.is_ascii_digit()).then(|| fd.parse().ok()).flatten()
+    fd.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| fd.parse().ok())
+        .flatten()
 }
 
 /// Everything after `fd/` when `path` names the caller's own descriptor table.

@@ -584,7 +584,10 @@ pub(crate) fn descriptor_path_tail(notif: &SeccompNotif, path: &str) -> Option<(
     }
     let tid = notif.pid as i32;
     // Only a numeric spelling is matched against the tgid, so read it only then.
-    let tgid = match path.strip_prefix("/proc/").and_then(|rest| rest.split('/').next()) {
+    let tgid = match path
+        .strip_prefix("/proc/")
+        .and_then(|rest| rest.split('/').next())
+    {
         Some(task) if !task.is_empty() && task.bytes().all(|b| b.is_ascii_digit()) => {
             tgid_of(notif.pid).unwrap_or(notif.pid) as i32
         }
