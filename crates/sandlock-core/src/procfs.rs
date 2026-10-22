@@ -748,6 +748,9 @@ fn own_fd_rest(path: &str, tid: i32, tgid: i32) -> Option<String> {
 pub(crate) fn own_fd_path_tail(path: &str, tid: i32, tgid: i32) -> Option<(i32, String)> {
     let rest = own_fd_rest(path, tid, tgid)?;
     let (fd, tail) = rest.split_once('/')?;
+    // A doubled slash would leave the tail absolute, and an absolute tail is
+    // resolved from the root rather than beneath the descriptor.
+    let tail = tail.trim_start_matches('/');
     if tail.is_empty() || !fd.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }

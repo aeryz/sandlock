@@ -504,15 +504,22 @@ async fn test_seccomp_cow_change_through_a_descriptor_path_is_staged() {
         "dfd = os.open('{wd}', os.O_RDONLY | os.O_DIRECTORY)\n",
         "fd = os.open(f'/proc/self/fd/{{dfd}}/created.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)\n",
         "os.write(fd, b'x'); os.close(fd)\n",
+        // A doubled slash is one separator, so this names a file nested under
+        // the descriptor, which does not exist.
+        "try:\n",
+        "    os.open(f'/proc/self/fd/{{dfd}}//{wd}/victim.txt', os.O_WRONLY)\n",
+        "    nested = 'OPENED'\n",
+        "except FileNotFoundError:\n",
+        "    nested = 'ENOENT'\n",
         "os.unlink(f'/proc/self/fd/{{dfd}}/victim.txt')\n",
-        "res = [open('{wd}/created.txt').read(), str(os.path.exists('{wd}/victim.txt'))]\n",
+        "res = [open('{wd}/created.txt').read(), str(os.path.exists('{wd}/victim.txt')), nested]\n",
         "open('{out}', 'w').write(','.join(res))\n",
     ), wd = workdir.display(), out = out_file.display());
 
     let result = policy.run(&["python3", "-c", &script]).await.unwrap();
     assert!(result.success(), "exit={:?}, stderr={}", result.code(), result.stderr_str().unwrap_or(""));
     // Staged under the file's real name, so the sandbox reads it back there.
-    assert_eq!(fs::read_to_string(&out_file).unwrap_or_default(), "x,False");
+    assert_eq!(fs::read_to_string(&out_file).unwrap_or_default(), "x,False,ENOENT");
     assert!(!workdir.join("created.txt").exists(), "the create escaped the branch");
     assert_eq!(
         fs::read_to_string(workdir.join("victim.txt")).unwrap_or_default(),
