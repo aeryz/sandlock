@@ -1103,21 +1103,35 @@ func (p *Process) Pid() int {
 //
 // Wait closes a still-open piped Stdin to deliver EOF, so do not write to Stdin
 // from another goroutine while Wait runs — the write would race a closing fd.
-func (p *Process) Wait() (*ExitStatus, error) { return p.wait(0) }
+func (p *Process) Wait() (*ExitStatus, error) { return p.wait(0, false) }
 
 // WaitTimeout is Wait with a deadline. It returns ErrTimeout if main is still
 // running when d elapses, leaving the session untouched.
 func (p *Process) WaitTimeout(d time.Duration) (*ExitStatus, error) {
+	return p.wait(timeoutMillis(d), false)
+}
+
+// Join is Wait that also waits until every background job has exited, so a
+// following Shutdown has nothing to kill. It returns main's status.
+func (p *Process) Join() (*ExitStatus, error) { return p.wait(0, true) }
+
+// JoinTimeout is Join with a deadline. It returns ErrTimeout if the session
+// still has a process when d elapses, leaving the session untouched.
+func (p *Process) JoinTimeout(d time.Duration) (*ExitStatus, error) {
+	return p.wait(timeoutMillis(d), true)
+}
+
+func timeoutMillis(d time.Duration) uint64 {
 	ms := d.Milliseconds()
 	if ms < 1 {
 		ms = 1
 	}
-	return p.wait(uint64(ms))
+	return uint64(ms)
 }
 
-func (p *Process) wait(ms uint64) (*ExitStatus, error) {
+func (p *Process) wait(ms uint64, join bool) (*ExitStatus, error) {
 	p.mu.Lock()
-	if p.status != nil {
+	if p.status != nil && (!join || p.result != nil) {
 		s := *p.status
 		p.mu.Unlock()
 		return &s, nil
@@ -1138,7 +1152,12 @@ func (p *Process) wait(ms uint64) (*ExitStatus, error) {
 	}
 
 	var r *C.sandlock_result_t
-	rc := C.sandlock_handle_wait(h, C.uint64_t(ms), &r)
+	var rc C.int
+	if join {
+		rc = C.sandlock_handle_join(h, C.uint64_t(ms), &r)
+	} else {
+		rc = C.sandlock_handle_wait(h, C.uint64_t(ms), &r)
+	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -969,6 +969,15 @@ char *sandlock_handle_process_groups(const sandlock_handle_t *h);
 int sandlock_handle_wait(sandlock_handle_t *h, uint64_t timeout_ms, sandlock_result_t **status);
 
 /**
+ * Like `sandlock_handle_wait`, but also waits until every background job
+ * has exited, so a following `sandlock_handle_shutdown` has nothing to kill.
+ *
+ * # Safety
+ * As for `sandlock_handle_wait`.
+ */
+int sandlock_handle_join(sandlock_handle_t *h, uint64_t timeout_ms, sandlock_result_t **status);
+
+/**
  * Kill what is left of the session, wait until it has no process, and return
  * main's status with the captured output and filesystem changes. Returns
  * null on error.

@@ -1504,16 +1504,46 @@ pub unsafe extern "C" fn sandlock_handle_wait(
     timeout_ms: u64,
     status: *mut *mut sandlock_result_t,
 ) -> c_int {
+    handle_wait(h, timeout_ms, status, false)
+}
+
+/// Like `sandlock_handle_wait`, but also waits until every background job
+/// has exited, so a following `sandlock_handle_shutdown` has nothing to kill.
+///
+/// # Safety
+/// As for `sandlock_handle_wait`.
+#[no_mangle]
+pub unsafe extern "C" fn sandlock_handle_join(
+    h: *mut sandlock_handle_t,
+    timeout_ms: u64,
+    status: *mut *mut sandlock_result_t,
+) -> c_int {
+    handle_wait(h, timeout_ms, status, true)
+}
+
+unsafe fn handle_wait(
+    h: *mut sandlock_handle_t,
+    timeout_ms: u64,
+    status: *mut *mut sandlock_result_t,
+    join: bool,
+) -> c_int {
     if h.is_null() || status.is_null() {
         return -1;
     }
     *status = ptr::null_mut();
     let sandbox = &mut (*h).sandbox;
     let outcome = block_on_runtime(&(*h).runtime, async {
+        let done = async {
+            if join {
+                sandbox.join().await
+            } else {
+                sandbox.wait().await
+            }
+        };
         if timeout_ms == 0 {
-            sandbox.wait().await.map(Some)
+            done.await.map(Some)
         } else {
-            match tokio::time::timeout(Duration::from_millis(timeout_ms), sandbox.wait()).await {
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), done).await {
                 Ok(r) => r.map(Some),
                 Err(_) => Ok(None),
             }

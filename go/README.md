@@ -140,8 +140,8 @@ func (s *Sandbox) Popen(stdio Stdio, cmd ...string) (*Process, error)
   `Wait` (or let `Wait` close it for you) so a reader child sees EOF; drain a
   piped `Stdout`/`Stderr` while waiting, or `Kill` from another goroutine to
   interrupt a blocked `Wait`. `Wait` returns the main process's `ExitStatus`
-  and leaves its background jobs supervised; `Shutdown` ends the session and
-  returns a `Result`. A Popen'd process sends piped output to the
+  and leaves its background jobs supervised; `Join` also waits for those jobs
+  to finish; `Shutdown` ends the session and returns a `Result`. A Popen'd process sends piped output to the
   `Stdout`/`Stderr` fields (inherited/null streams go to the parent fd or
   `/dev/null`), so (unlike `Run`) `Result.Stdout`/`Result.Stderr` are always
   empty.
@@ -271,6 +271,8 @@ sb := &sandlock.Sandbox{
 func (p *Process) Pid() int
 func (p *Process) Wait() (*ExitStatus, error)   // main exited; background jobs keep running
 func (p *Process) WaitTimeout(d time.Duration) (*ExitStatus, error) // ErrTimeout leaves the session
+func (p *Process) Join() (*ExitStatus, error)   // main and every background job exited
+func (p *Process) JoinTimeout(d time.Duration) (*ExitStatus, error) // ErrTimeout leaves the session
 func (p *Process) Shutdown() (*Result, error)   // kill what is left, reap it, collect the result
 func (p *Process) ProcessGroups() ([]int, error) // groups that still have members
 func (p *Process) Pause() error           // SIGSTOP to every process group
@@ -279,7 +281,7 @@ func (p *Process) Kill() error            // SIGKILL
 func (p *Process) Ports() (map[int]int, error) // virtual→real, with PortRemap
 func (p *Process) Close() error           // release the handle (ends the session), close piped streams
 
-// Kill, Pause and Resume work while another goroutine is blocked in Wait.
+// Kill, Pause and Resume work while another goroutine is blocked in Wait or Join.
 
 // BranchActionDefer only: after Shutdown, the change set stays on the Process.
 func (p *Process) Pending() bool          // exited under Defer and undecided
