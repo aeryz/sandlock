@@ -571,6 +571,31 @@ pub(crate) fn open_base_dir(pid: u32, dirfd: i64) -> Result<OwnedFd, i32> {
     }
 }
 
+/// The descriptor a path names, and what it names beneath it.
+///
+/// `/proc/<task>/fd/N/name` and `/dev/fd/N/name` are `openat(N, name)` under
+/// another spelling, so the caller resolves the pair the way it resolves any
+/// other dirfd and path.
+///
+/// `None` for a bare descriptor or a path that names no descriptor at all.
+pub(crate) fn descriptor_path_tail(notif: &SeccompNotif, path: &str) -> Option<(i32, String)> {
+    if !path.starts_with("/proc/") && !path.starts_with("/dev/") {
+        return None;
+    }
+    let tid = notif.pid as i32;
+    // Only a numeric spelling is matched against the tgid, so read it only then.
+    let tgid = match path
+        .strip_prefix("/proc/")
+        .and_then(|rest| rest.split('/').next())
+    {
+        Some(task) if !task.is_empty() && task.bytes().all(|b| b.is_ascii_digit()) => {
+            tgid_of(notif.pid).unwrap_or(notif.pid) as i32
+        }
+        _ => tid,
+    };
+    crate::procfs::own_fd_path_tail(path, tid, tgid)
+}
+
 /// Real path of an open fd via its `/proc/self/fd` magic link.
 fn realpath_of_fd(fd: RawFd) -> Option<std::path::PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", fd)).ok()

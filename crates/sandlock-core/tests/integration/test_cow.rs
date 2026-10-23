@@ -478,6 +478,83 @@ async fn test_seccomp_cow_openat2_syscall() {
     let _ = fs::remove_file(&out_file);
 }
 
+/// A path through one of the caller's own descriptors names a file the branch
+/// owns, under a spelling that does not look like it, so the change belongs in
+/// the branch and an abort takes it back.
+#[tokio::test]
+async fn test_seccomp_cow_change_through_a_descriptor_path_is_staged() {
+    let workdir = temp_dir("seccomp-cow-descriptor-path");
+    fs::write(workdir.join("victim.txt"), b"precious").unwrap();
+    let out_file = std::env::temp_dir().join(format!(
+        "sandlock-test-cow-descriptor-{}",
+        std::process::id()
+    ));
+
+    let mut policy = Sandbox::builder()
+        .fs_read("/usr")
+        .fs_read("/lib")
+        .fs_read_if_exists("/lib64")
+        .fs_read("/bin")
+        .fs_read("/etc")
+        .fs_read("/proc")
+        .fs_read("/dev")
+        .fs_write(&workdir)
+        .fs_write("/tmp")
+        .workdir(&workdir)
+        .cwd(&workdir)
+        .on_exit(BranchAction::Abort)
+        .build()
+        .unwrap();
+
+    let script = format!(concat!(
+        "import os\n",
+        "dfd = os.open('{wd}', os.O_RDONLY | os.O_DIRECTORY)\n",
+        "fd = os.open(f'/proc/self/fd/{{dfd}}/created.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)\n",
+        "os.write(fd, b'x'); os.close(fd)\n",
+        // A doubled slash is one separator, so this names a file nested under
+        // the descriptor, which does not exist.
+        "try:\n",
+        "    os.open(f'/proc/self/fd/{{dfd}}//{wd}/victim.txt', os.O_WRONLY)\n",
+        "    nested = 'OPENED'\n",
+        "except FileNotFoundError:\n",
+        "    nested = 'ENOENT'\n",
+        "os.unlink(f'/proc/self/fd/{{dfd}}/victim.txt')\n",
+        // The directory exists only in the branch, so the file inside it has
+        // to be resolved there too.
+        "os.mkdir(f'/proc/self/fd/{{dfd}}/sub')\n",
+        "fd = os.open(f'/proc/self/fd/{{dfd}}/sub/inner.txt', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)\n",
+        "os.write(fd, b'z'); os.close(fd)\n",
+        "res = [open('{wd}/created.txt').read(), str(os.path.exists('{wd}/victim.txt')), nested,\n",
+        "       open('{wd}/sub/inner.txt').read()]\n",
+        "open('{out}', 'w').write(','.join(res))\n",
+    ), wd = workdir.display(), out = out_file.display());
+
+    let result = policy.run(&["python3", "-c", &script]).await.unwrap();
+    assert!(
+        result.success(),
+        "exit={:?}, stderr={}",
+        result.code(),
+        result.stderr_str().unwrap_or("")
+    );
+    // Staged under the file's real name, so the sandbox reads it back there.
+    assert_eq!(
+        fs::read_to_string(&out_file).unwrap_or_default(),
+        "x,False,ENOENT,z"
+    );
+    assert!(
+        !workdir.join("created.txt").exists(),
+        "the create escaped the branch"
+    );
+    assert_eq!(
+        fs::read_to_string(workdir.join("victim.txt")).unwrap_or_default(),
+        "precious",
+        "the unlink escaped the branch",
+    );
+
+    let _ = fs::remove_dir_all(&workdir);
+    let _ = fs::remove_file(&out_file);
+}
+
 /// renameat must land in the COW layer like rename and renameat2.
 ///
 /// Regression test: COW registered renameat2 and legacy rename but not
