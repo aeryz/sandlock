@@ -870,7 +870,7 @@ async fn test_chroot() {
     let _ = std::fs::create_dir_all(chroot_dir.join("usr/bin"));
     let _ = std::fs::create_dir_all(chroot_dir.join("tmp"));
 
-    let helper = std::path::PathBuf::from(env!("ROOTFS_HELPER_PATH"));
+    let helper = std::path::PathBuf::from(sandlock_fixtures::ROOTFS_HELPER);
     if !helper.exists() {
         eprintln!("chroot test skipped (rootfs-helper not compiled by build.rs)");
         return;

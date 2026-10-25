@@ -3,21 +3,18 @@
 
 from __future__ import annotations
 
+import functools
+import subprocess
 from pathlib import Path
 
-import pytest
-
-_TARGET = Path(__file__).resolve().parents[2] / "target"
+_REPO = Path(__file__).resolve().parents[2]
 
 
+@functools.cache
 def rootfs_helper() -> Path:
-    """The rootfs-helper that sandlock-core's build.rs compiles into its OUT_DIR."""
-    found = [
-        p
-        for pattern in ("*/build/sandlock-core-*/out/rootfs-helper",
-                        "*/*/build/sandlock-core-*/out/rootfs-helper")
-        for p in _TARGET.glob(pattern)
-    ]
-    if not found:
-        pytest.fail("rootfs-helper not built (sandlock-core's build.rs compiles it)")
-    return max(found, key=lambda p: p.stat().st_mtime)
+    """The rootfs-helper that the sandlock-fixtures crate builds."""
+    out = subprocess.run(
+        ["cargo", "run", "-q", "-p", "sandlock-fixtures"],
+        cwd=_REPO, check=True, capture_output=True, text=True,
+    )
+    return Path(out.stdout.strip())

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 /// exercises the full restore engine (memory, registers, reopened fd) plus vDSO
 /// relocation without any embedded C in the test.
 fn helper_binary() -> PathBuf {
-    let helper = PathBuf::from(env!("ROOTFS_HELPER_PATH"));
+    let helper = PathBuf::from(sandlock_fixtures::ROOTFS_HELPER);
     assert!(
         helper.is_file(),
         "rootfs-helper not found; build.rs should have compiled it"

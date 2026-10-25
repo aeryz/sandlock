@@ -10,10 +10,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	sandlock "github.com/multikernel/sandlock/go"
 )
@@ -67,29 +67,15 @@ func must(t *testing.T, err error) {
 	}
 }
 
-// rootfsHelper reads the static rootfs-helper that sandlock-core's build.rs
-// compiles into its OUT_DIR.
+// rootfsHelper reads the static rootfs-helper that the sandlock-fixtures
+// crate builds.
 func rootfsHelper(t *testing.T) []byte {
 	t.Helper()
-	var found []string
-	for _, pattern := range []string{
-		"../target/*/build/sandlock-core-*/out/rootfs-helper",
-		"../target/*/*/build/sandlock-core-*/out/rootfs-helper",
-	} {
-		m, _ := filepath.Glob(pattern)
-		found = append(found, m...)
-	}
-	var newest string
-	var newestTime time.Time
-	for _, p := range found {
-		if fi, err := os.Stat(p); err == nil && fi.ModTime().After(newestTime) {
-			newest, newestTime = p, fi.ModTime()
-		}
-	}
-	if newest == "" {
-		t.Skip("rootfs-helper not built (sandlock-core's build.rs compiles it)")
-	}
-	helper, err := os.ReadFile(newest)
+	cmd := exec.Command("cargo", "run", "-q", "-p", "sandlock-fixtures")
+	cmd.Dir = ".."
+	out, err := cmd.Output()
+	must(t, err)
+	helper, err := os.ReadFile(strings.TrimSpace(string(out)))
 	must(t, err)
 	return helper
 }

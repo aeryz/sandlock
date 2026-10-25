@@ -249,26 +249,6 @@ fn builder_fs_mount_refuses_unusable_paths_exactly_like_fs_mount_ro() {
 // End-to-end: what a read-only mount enforces on a real guest
 // ----------------------------------------------------------------
 
-/// The static rootfs-helper that sandlock-core's build.rs compiles into its
-/// OUT_DIR; that env is private to sandlock-core, so find it in the target dir.
-fn helper_binary() -> PathBuf {
-    let profile_dir = std::env::current_exe().unwrap();
-    let profile_dir = profile_dir.parent().and_then(Path::parent).unwrap();
-    fs::read_dir(profile_dir.join("build"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("sandlock-core-")
-        })
-        .map(|e| e.path().join("out/rootfs-helper"))
-        .filter(|p| p.is_file())
-        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
-        .expect("rootfs-helper not found; sandlock-core's build.rs should have compiled it")
-}
-
 fn temp_dir(name: &str) -> PathBuf {
     // Prefer cargo's per-test-binary tmp dir (same filesystem as the
     // compiled helper) so the rootfs can hard-link it instead of copying:
@@ -289,7 +269,7 @@ fn temp_dir(name: &str) -> PathBuf {
 /// Minimal self-contained rootfs with the busybox-style rootfs-helper.
 fn build_test_rootfs(name: &str) -> PathBuf {
     let rootfs = temp_dir(name);
-    let helper = helper_binary();
+    let helper = PathBuf::from(sandlock_fixtures::ROOTFS_HELPER);
 
     for dir in &["usr/bin", "etc", "proc", "dev", "tmp"] {
         fs::create_dir_all(rootfs.join(dir)).expect("failed to create rootfs dir");

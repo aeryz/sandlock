@@ -12,7 +12,7 @@ fn temp_dir(name: &str) -> PathBuf {
 
 /// Path to the static rootfs-helper binary (compiled by build.rs).
 fn helper_binary() -> PathBuf {
-    let helper = PathBuf::from(env!("ROOTFS_HELPER_PATH"));
+    let helper = PathBuf::from(sandlock_fixtures::ROOTFS_HELPER);
     assert!(
         helper.is_file(),
         "rootfs-helper not found; build.rs should have compiled it"

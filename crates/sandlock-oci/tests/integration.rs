@@ -686,29 +686,6 @@ fn which(prog: &str) -> bool {
     })
 }
 
-/// The static rootfs-helper that sandlock-core's build.rs compiles into its
-/// OUT_DIR; that env is private to sandlock-core, so find it in the target dir.
-fn rootfs_helper() -> std::path::PathBuf {
-    let profile_dir = std::env::current_exe().unwrap();
-    let profile_dir = profile_dir
-        .parent()
-        .and_then(std::path::Path::parent)
-        .unwrap();
-    std::fs::read_dir(profile_dir.join("build"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("sandlock-core-")
-        })
-        .map(|e| e.path().join("out/rootfs-helper"))
-        .filter(|p| p.is_file())
-        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
-        .unwrap_or_default()
-}
-
 /// End-to-end proof that `sandlock-oci exec` runs an extra process inside the
 /// SAME single-init container as the main workload, confined by the shared
 /// sandbox (Landlock + seccomp-notify), and reports its exit status.
@@ -726,7 +703,7 @@ async fn oci_exec_same_sandbox() {
         eprintln!("skipping: no Landlock");
         return;
     }
-    let helper = rootfs_helper();
+    let helper = std::path::PathBuf::from(sandlock_fixtures::ROOTFS_HELPER);
     if !helper.exists() {
         eprintln!("skipping: no rootfs-helper");
         return;
@@ -857,7 +834,7 @@ async fn oci_stop_collapses_process_group() {
         eprintln!("skipping: Landlock unavailable on this host");
         return;
     }
-    let helper = rootfs_helper();
+    let helper = std::path::PathBuf::from(sandlock_fixtures::ROOTFS_HELPER);
     if !helper.exists() {
         eprintln!("skipping: rootfs-helper not built (needs musl-gcc or cc -static)");
         return;

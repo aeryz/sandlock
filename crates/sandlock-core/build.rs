@@ -1,35 +1,15 @@
-use std::path::Path;
+mod build_support;
+
+use build_support::{build_static, target_arch, target_compilers};
 use std::path::PathBuf;
-use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let repo_root = manifest_dir.join("../..");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let host = std::env::var("HOST").unwrap_or_default();
     let target = std::env::var("TARGET").unwrap_or_default();
     let is_riscv64 = target.starts_with("riscv64");
-    let arch = target.split('-').next().unwrap_or_default();
-    let arch = if is_riscv64 { "riscv64" } else { arch };
-
-    // rootfs-helper: an ordinary static-libc test fixture (chroot tests). It is
-    // built into OUT_DIR so a git dependency never writes into its checkout.
-    let helper_bin = out_dir.join("rootfs-helper");
-    if !build_static(
-        &repo_root.join("tests/rootfs-helper.c"),
-        &helper_bin,
-        &target_compilers(&target, &host, arch, &["musl-gcc", "cc"]),
-        &["-static", "-O2"],
-    ) {
-        println!(
-            "cargo:warning=cannot compile rootfs-helper: chroot tests will \
-             fail. Install musl-tools or static libc."
-        );
-    }
-    println!(
-        "cargo:rustc-env=ROOTFS_HELPER_PATH={}",
-        helper_bin.display()
-    );
+    let arch = target_arch(&target);
 
     #[cfg(feature = "checkpoint")]
     {
@@ -133,77 +113,4 @@ fn main() {
         "cargo:rustc-env=SHEBANG_TRAMPOLINE_PATH={}",
         tramp_bin.display()
     );
-}
-
-/// Compile `src` to `bin` with the first working compiler in `ccs`, skipping the
-/// work when `bin` is newer than both `src` and this build script (the flags
-/// live here, so a flag change must recompile). Returns `false` only when the
-/// source is present, stale, and no compiler in `ccs` succeeded; a missing
-/// source (a packaged crate) or an up-to-date `bin` reports success. The caller
-/// decides whether that failure is a hard error or a warning.
-fn build_static(src: &Path, bin: &Path, ccs: &[String], args: &[&str]) -> bool {
-    println!("cargo:rerun-if-changed={}", src.display());
-    if !src.exists() {
-        return true;
-    }
-    let mtime = |p: &Path| p.metadata().and_then(|m| m.modified()).ok();
-    let build_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs");
-    if let (Some(bt), Some(st), Some(rt)) = (mtime(bin), mtime(src), mtime(&build_rs)) {
-        if bt >= st && bt >= rt {
-            return true;
-        }
-    }
-    for cc in ccs {
-        let mut words = cc.split_whitespace();
-        let Some(program) = words.next() else {
-            continue;
-        };
-        let ok = Command::new(program)
-            .args(words)
-            .args(args)
-            .arg("-o")
-            .arg(bin)
-            .arg(src)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            return true;
-        }
-    }
-    false
-}
-
-/// C compilers to try for `target`. A configured one is the only candidate, so a
-/// broken setting fails instead of silently falling back to another compiler.
-fn target_compilers(target: &str, host: &str, arch: &str, native: &[&str]) -> Vec<String> {
-    let mut vars = vec![
-        format!("CC_{target}"),
-        format!("CC_{}", target.replace('-', "_")),
-        "TARGET_CC".to_string(),
-    ];
-    if host == target {
-        vars.push("CC".to_string());
-    }
-    for var in &vars {
-        println!("cargo:rerun-if-env-changed={var}");
-    }
-    if let Some(cc) = vars.iter().find_map(|v| std::env::var(v).ok()) {
-        return vec![cc];
-    }
-
-    let mut ccs = Vec::new();
-    if host.split('-').next() == target.split('-').next() {
-        ccs.extend(native.iter().map(|cc| cc.to_string()));
-    }
-    let env = target.rsplit('-').next().unwrap_or_default();
-    for env in [env, "gnu"] {
-        for vendor in ["", "unknown-"] {
-            let cc = format!("{arch}-{vendor}linux-{env}-gcc");
-            if !ccs.contains(&cc) {
-                ccs.push(cc);
-            }
-        }
-    }
-    ccs
 }
