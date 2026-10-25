@@ -10,7 +10,7 @@ description = "Lightweight process sandbox using Landlock, seccomp-bpf, and secc
 
 [dependencies]
 landlock = { version = "0.4.7", default-features = false }
-libc = "0.2"
+libc = "0.2.191"
 log = "0.4"
 syscalls = { version = "0.8", default-features = false }
 nix = { version = "0.29", features = ["process", "signal", "fs", "ioctl", "poll", "user"] }
@@ -56,6 +56,7 @@ http = [
 ]
 
 [dev-dependencies]
+sandlock-fixtures = { path = "../sandlock-fixtures" }
 toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"

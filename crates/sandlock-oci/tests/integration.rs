@@ -686,14 +686,6 @@ fn which(prog: &str) -> bool {
     })
 }
 
-/// Path to the prebuilt static `rootfs-helper` (compiled by sandlock-core's
-/// build.rs). It is a self-contained, busybox-style binary the chroot
-/// integration tests drop into a rootfs; building `sandlock-oci` pulls in
-/// `sandlock-core`, so the binary is available here too.
-fn rootfs_helper() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper")
-}
-
 /// End-to-end proof that `sandlock-oci exec` runs an extra process inside the
 /// SAME single-init container as the main workload, confined by the shared
 /// sandbox (Landlock + seccomp-notify), and reports its exit status.
@@ -711,7 +703,7 @@ async fn oci_exec_same_sandbox() {
         eprintln!("skipping: no Landlock");
         return;
     }
-    let helper = rootfs_helper();
+    let helper = std::path::PathBuf::from(sandlock_fixtures::ROOTFS_HELPER);
     if !helper.exists() {
         eprintln!("skipping: no rootfs-helper");
         return;
@@ -842,7 +834,7 @@ async fn oci_stop_collapses_process_group() {
         eprintln!("skipping: Landlock unavailable on this host");
         return;
     }
-    let helper = rootfs_helper();
+    let helper = std::path::PathBuf::from(sandlock_fixtures::ROOTFS_HELPER);
     if !helper.exists() {
         eprintln!("skipping: rootfs-helper not built (needs musl-gcc or cc -static)");
         return;

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,10 +23,7 @@ import (
 // layer does not contain.
 func writeHelperImage(t *testing.T, dir string) {
 	t.Helper()
-	helper, err := os.ReadFile("../tests/rootfs-helper")
-	if err != nil {
-		t.Skipf("rootfs-helper not built (sandlock-core's build.rs compiles it): %v", err)
-	}
+	helper := rootfsHelper(t)
 
 	var layer bytes.Buffer
 	tw := tar.NewWriter(&layer)
@@ -33,7 +31,7 @@ func writeHelperImage(t *testing.T, dir string) {
 		must(t, tw.WriteHeader(&tar.Header{Name: d, Typeflag: tar.TypeDir, Mode: 0o755}))
 	}
 	must(t, tw.WriteHeader(&tar.Header{Name: "usr/bin/rootfs-helper", Mode: 0o755, Size: int64(len(helper))}))
-	_, err = tw.Write(helper)
+	_, err := tw.Write(helper)
 	must(t, err)
 	must(t, tw.Close())
 
@@ -67,6 +65,19 @@ func must(t *testing.T, err error) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// rootfsHelper reads the static rootfs-helper that the sandlock-fixtures
+// crate builds.
+func rootfsHelper(t *testing.T) []byte {
+	t.Helper()
+	cmd := exec.Command("cargo", "run", "-q", "-p", "sandlock-fixtures")
+	cmd.Dir = ".."
+	out, err := cmd.Output()
+	must(t, err)
+	helper, err := os.ReadFile(strings.TrimSpace(string(out)))
+	must(t, err)
+	return helper
 }
 
 func TestPullImageAndRunInIt(t *testing.T) {

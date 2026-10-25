@@ -27,6 +27,7 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
+sandlock-fixtures = { path = "../sandlock-fixtures" }
 tokio = { version = "1", features = ["macros"] }
 tempfile = "3"
 ring = "0.17"

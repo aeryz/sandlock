@@ -6,7 +6,7 @@
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::{c_char, c_int, c_uint};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::ptr;
 
 use sandlock_ffi::{
@@ -38,9 +38,7 @@ fn sha256_hex(data: &[u8]) -> String {
 /// An OCI layout holding one image: the static rootfs-helper plus a config
 /// that sets Env and a WorkingDir the layer does not contain.
 fn helper_image_layout(dir: &Path) {
-    let helper =
-        fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/rootfs-helper"))
-            .expect("rootfs-helper not built; sandlock-core's build.rs compiles it");
+    let helper = fs::read(sandlock_fixtures::ROOTFS_HELPER).unwrap();
 
     let mut layer = tar::Builder::new(Vec::new());
     for d in ["usr/", "usr/bin/", "proc/", "dev/", "tmp/"] {

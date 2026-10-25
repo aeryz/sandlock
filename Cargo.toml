@@ -5,6 +5,13 @@ members = [
     "crates/sandlock-cli",
     "crates/sandlock-ffi",
     "crates/sandlock-oci",
+    "crates/sandlock-fixtures",
+]
+default-members = [
+    "crates/sandlock-core",
+    "crates/sandlock-cli",
+    "crates/sandlock-ffi",
+    "crates/sandlock-oci",
 ]
 
 [workspace.package]
